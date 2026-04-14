@@ -9,10 +9,28 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 def apply_ac(model):
-    """Apply activation checkpointing to the model."""
+    """Apply selective activation checkpointing to transformer blocks.
+
+    Layers 0–9: whole-block checkpoint only (faster).
+    Layers 10+: extra checkpointing on self-attn and FFN (lower activation memory).
+    """
     for layer_id, transformer_block in enumerate(model.blocks):
-        transformer_block = ptd_checkpoint_wrapper(transformer_block, preserve_rng_state=False)
-        model.blocks[layer_id] = transformer_block
+        if layer_id >= 10:
+            if hasattr(transformer_block, "attn1"):
+                transformer_block.attn1 = ptd_checkpoint_wrapper(
+                    transformer_block.attn1,
+                    preserve_rng_state=False,
+                )
+            if hasattr(transformer_block, "ffn"):
+                transformer_block.ffn = ptd_checkpoint_wrapper(
+                    transformer_block.ffn,
+                    preserve_rng_state=False,
+                )
+        wrapped = ptd_checkpoint_wrapper(
+            transformer_block,
+            preserve_rng_state=False,
+        )
+        model.blocks[layer_id] = wrapped
 
 
 def shard_model(model,

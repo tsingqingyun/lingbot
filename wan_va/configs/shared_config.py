@@ -18,3 +18,6 @@ va_shared_cfg.enable_offload = True
 va_shared_cfg.cuda_mem_log_path = None
 # Log every N optimizer steps (1 = each step).
 va_shared_cfg.cuda_mem_log_every = 1
+
+# torch.amp.autocast around forward; GradScaler is used only when param_dtype is float16.
+va_shared_cfg.use_amp = True

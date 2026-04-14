@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
@@ -235,7 +236,7 @@ class Trainer:
         self.transformer = load_transformer(
             transformer_path,
             torch_dtype=torch.float32,
-            torch_device='cpu',
+            torch_device="cpu",
         )
 
         logger.info("Setting up activation checkpointing ...")
@@ -328,6 +329,11 @@ class Trainer:
 
         self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
+
+        self._use_amp = bool(getattr(config, "use_amp", True)) and torch.cuda.is_available()
+        self._amp_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        self._use_fp16_scaler = self._use_amp and self.dtype == torch.float16
+        self._grad_scaler = GradScaler("cuda", enabled=self._use_fp16_scaler)
         # if hasattr(config, 'resume_from') and config.resume_from:
         #     self._load_training_state(config.resume_from)
     def report_cuda_mem(self, tag=""):
@@ -601,15 +607,22 @@ class Trainer:
         if self.step < 3 and batch_idx == 0:
             self.report_cuda_mem("before forward")
 
-        output = self.transformer(input_dict, train_mode=True)
+        with autocast(
+            device_type="cuda",
+            dtype=self._amp_dtype,
+            enabled=self._use_amp,
+        ):
+            output = self.transformer(input_dict, train_mode=True)
+            latent_loss, action_loss = self.compute_loss(input_dict, output)
+            loss = latent_loss + action_loss
 
         if self.step < 3 and batch_idx == 0:
             self.report_cuda_mem("after forward")
 
-        latent_loss, action_loss = self.compute_loss(input_dict, output)
-        loss = latent_loss + action_loss
-
-        loss.backward()
+        if self._use_fp16_scaler:
+            self._grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if self.step < 3 and batch_idx == 0:
             self.report_cuda_mem("after backward")
@@ -620,8 +633,14 @@ class Trainer:
         }
 
         if should_sync:
+            if self._use_fp16_scaler:
+                self._grad_scaler.unscale_(self.optimizer)
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
-            self.optimizer.step()
+            if self._use_fp16_scaler:
+                self._grad_scaler.step(self.optimizer)
+                self._grad_scaler.update()
+            else:
+                self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
 

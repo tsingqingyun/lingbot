@@ -28,8 +28,9 @@ va_robocasa_train_cfg.beta1 = 0.9
 va_robocasa_train_cfg.beta2 = 0.95
 va_robocasa_train_cfg.weight_decay = 0.1
 va_robocasa_train_cfg.warmup_steps = 10
-va_robocasa_train_cfg.batch_size = 1
-va_robocasa_train_cfg.gradient_accumulation_steps = 6
+# Effective batch = batch_size * gradient_accumulation_steps * world_size (same as 1×6).
+va_robocasa_train_cfg.batch_size = 2
+va_robocasa_train_cfg.gradient_accumulation_steps = 4
 va_robocasa_train_cfg.num_steps = 50000
 
 # 显存 CSV：allocated/reserved/max_*（MiB），每步在 optimizer 更新后、empty_cache 前写入；{rank}=本进程 local_rank

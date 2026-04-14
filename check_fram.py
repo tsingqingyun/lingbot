@@ -17,7 +17,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from wan_va.configs import get_config
 from wan_va.dataset import MultiLatentLeRobotDataset
-from wan_va.model import FlexAttnFunc
+from wan_va.modules.model import FlexAttnFunc
 
 def to_python(x):
     if isinstance(x, torch.Tensor):

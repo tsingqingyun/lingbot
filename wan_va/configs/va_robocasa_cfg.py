@@ -6,7 +6,7 @@ from .shared_config import va_shared_cfg
 va_robocasa_cfg = EasyDict(__name__='Config: VA robocasa')
 va_robocasa_cfg.update(va_shared_cfg)
 
-va_robocasa_cfg.wan22_pretrained_model_name_or_path = "/cephfs/shared/xcxhx/lingbot-va"
+va_robocasa_cfg.wan22_pretrained_model_name_or_path = "/root/lingbot-va-base"
     
 va_robocasa_cfg.attn_window = 72
 va_robocasa_cfg.frame_chunk_size = 2
