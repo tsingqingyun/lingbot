@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Envs
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+logs/
+log/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Training / debug outputs
+train_out/
+debug_check/
+debug_rc/
+debug_dataloader/
+debug_dataloader_100/
+debug_fast/
+debug_comprehensive_check/
+
+# Large binary / artifacts
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.whl
+
+# Media / generated assets
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.mov
+*.avi
+
+# OS / editor
+.DS_Store
+.vscode-test/
+*.pth
+*.h5
+*.hdf5
+datasets/
+__pycache__/

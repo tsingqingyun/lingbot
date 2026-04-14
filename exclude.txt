@@ -1,0 +1,5 @@
+# 相对 lingbot-va/ 根目录，不要用绝对路径
+# 仅排除「仓库根下」以 debug_ 开头的目录（如 debug_check、debug_xxx）
+/debug_*/
+train_out_1/
+__pycache__/

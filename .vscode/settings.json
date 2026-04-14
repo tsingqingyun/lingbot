@@ -1,0 +1,24 @@
+{
+  "files.watcherExclude": {
+    "**/train_out/**": true,
+    "**/debug_check/**": true,
+    "**/debug_rc/**": true,
+    "**/debug_dataloader/**": true,
+    "**/debug_dataloader_100/**": true,
+    "**/debug_fast/**": true,
+    "**/debug_comprehensive_check/**": true,
+    "**/__pycache__/**": true,
+    "**/*.pyc": true
+  },
+  "search.exclude": {
+    "**/train_out/**": true,
+    "**/debug_check/**": true,
+    "**/debug_rc/**": true,
+    "**/debug_dataloader/**": true,
+    "**/debug_dataloader_100/**": true,
+    "**/debug_fast/**": true,
+    "**/debug_comprehensive_check/**": true,
+    "**/__pycache__/**": true
+  },
+  "git.untrackedChanges": "hidden"
+}
