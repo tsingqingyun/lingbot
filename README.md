@@ -205,6 +205,8 @@ python -m torch.distributed.run --nproc_per_node 1 --master_port ${MASTER_PORT} 
 bash evaluation/robocasa/launch_client_robocasa.sh ./results_robocasa "robocasa/PickPlaceCounterToCabinet" 1
 ```
 
+`--config-name robocasa` loads the built-in config at `wan_va/configs/va_robocasa_cfg.py`.
+
 You can also run the client directly for custom options:
 
 ```bash

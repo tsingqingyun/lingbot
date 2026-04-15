@@ -67,9 +67,10 @@ def format_obs_for_lingbot(obs: Dict) -> Dict:
     for target_key, candidates in DEFAULT_OBS_KEY_CANDIDATES.items():
         value = _find_obs_value(obs, candidates)
         if value is None:
+            available = sorted(list(obs.keys()))
             raise KeyError(
                 f"Missing camera key for {target_key}. candidates={list(candidates)}, "
-                f"available={sorted(list(obs.keys()))[:40]}"
+                f"available(first 40/{len(available)})={available[:40]}"
             )
         out[target_key] = _to_hwc_uint8(value)
     return out
@@ -99,7 +100,7 @@ def infer_success(info: Dict, terminated: bool) -> bool:
 
 def create_env(env_id: str, split: str, seed: Optional[int], render_mode: Optional[str]):
     import gymnasium as gym
-    import robocasa  # noqa: F401
+    import robocasa  # noqa: F401  # import required to register robocasa/* env IDs with gymnasium
 
     kwargs = {"split": split}
     if seed is not None:
@@ -145,9 +146,15 @@ def run_episode(
         )
         pred = np.asarray(ret["action"], dtype=np.float32)
         if pred.ndim != 3:
-            raise ValueError(f"Expected action shape [C,F,H], got {pred.shape}")
+            raise ValueError(
+                f"Expected action shape [C,F,H] where C=used action channels, "
+                f"F=predicted frame chunks, H=actions per frame, and C={len(USED_ACTION_CHANNEL_IDS)}; "
+                f"got {pred.shape}"
+            )
 
-        action_12_batch = lingbot_to_robocasa(used_channels_to_action30(pred.transpose(1, 2, 0).reshape(-1, pred.shape[0])))
+        action_used_batch = pred.transpose(1, 2, 0).reshape(-1, pred.shape[0])
+        action_30_batch = used_channels_to_action30(action_used_batch)
+        action_12_batch = lingbot_to_robocasa(action_30_batch)
         action_12_seq = action_12_batch.reshape(pred.shape[1], pred.shape[2], 12)
 
         key_frame_list = []
@@ -169,7 +176,8 @@ def run_episode(
                 frame = format_obs_for_lingbot(obs)
                 frames_for_video.append(frame["observation.images.robot0_agentview_left"])
 
-                if (j + 1) % action_12_seq.shape[1] == 0:
+                is_last_in_horizon = (j + 1) == action_12_seq.shape[1]
+                if is_last_in_horizon:
                     key_frame_list.append(frame)
 
                 if done or step_count >= max_steps:
@@ -222,11 +230,20 @@ def main():
         env_seed = args.seed + ep
         env = create_env(args.env_id, split=args.split, seed=env_seed, render_mode=args.render_mode)
         try:
-            prompt = args.prompt if args.prompt else str(getattr(env.unwrapped, "instruction", args.env_id))
+            if args.prompt:
+                episode_prompt = args.prompt
+            else:
+                episode_prompt = getattr(env.unwrapped, "instruction", None)
+                if not episode_prompt:
+                    print(
+                        "[Warn] env.unwrapped.instruction is missing; "
+                        f"fallback prompt uses env_id='{args.env_id}'."
+                    )
+                    episode_prompt = args.env_id
             ok, steps, frames = run_episode(
                 env=env,
                 model=model,
-                prompt=prompt,
+                prompt=episode_prompt,
                 max_steps=args.max_steps,
                 video_guidance_scale=args.video_guidance_scale,
                 action_guidance_scale=args.action_guidance_scale,
@@ -241,12 +258,13 @@ def main():
             "success": bool(ok),
             "steps": int(steps),
             "env_id": args.env_id,
-            "prompt": prompt,
+            "prompt": episode_prompt,
         }
         episode_metrics.append(record)
 
         if args.save_video and len(frames) > 0:
-            video_path = video_dir / f"ep_{ep:03d}_seed_{env_seed}_{int(ok)}.mp4"
+            status = "success" if ok else "fail"
+            video_path = video_dir / f"ep_{ep:03d}_seed_{env_seed}_{status}.mp4"
             imageio.mimsave(video_path, frames, fps=15)
 
         print(
