@@ -8,17 +8,29 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
 
-def apply_ac(model):
+
+def apply_ac(
+    model,
+    inner_checkpoint_min_layer: int = 10,
+    checkpoint_attn2: bool = True,
+):
     """Apply selective activation checkpointing to transformer blocks.
 
-    Layers 0–9: whole-block checkpoint only (faster).
-    Layers 10+: extra checkpointing on self-attn and FFN (lower activation memory).
+    Every block is wrapped with block-level checkpointing. For layers
+    ``>= inner_checkpoint_min_layer``, also checkpoint ``attn1``/``ffn`` and
+    optionally ``attn2`` (cross-attention; saves VRAM when text is long).
+    Set ``inner_checkpoint_min_layer`` to 30 to disable inner wraps.
     """
     for layer_id, transformer_block in enumerate(model.blocks):
-        if layer_id >= 10:
+        if layer_id >= inner_checkpoint_min_layer:
             if hasattr(transformer_block, "attn1"):
                 transformer_block.attn1 = ptd_checkpoint_wrapper(
                     transformer_block.attn1,
+                    preserve_rng_state=False,
+                )
+            if checkpoint_attn2 and hasattr(transformer_block, "attn2"):
+                transformer_block.attn2 = ptd_checkpoint_wrapper(
+                    transformer_block.attn2,
                     preserve_rng_state=False,
                 )
             if hasattr(transformer_block, "ffn"):
@@ -33,9 +45,13 @@ def apply_ac(model):
         model.blocks[layer_id] = wrapped
 
 
-def shard_model(model,
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32):
+def shard_model(
+    model,
+    param_dtype=torch.bfloat16,
+    reduce_dtype=torch.float32,
+):
+    """FSDP ``fully_shard`` (no param CPU offload: ``CPUOffloadPolicy`` with nested
+    ``fully_shard`` has been unreliable in this stack)."""
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,

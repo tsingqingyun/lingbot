@@ -11,7 +11,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configs import get_config
-from dataset import MultiLatentLeRobotDataset
+from .dataset import MultiLatentLeRobotDataset
 
 
 def main():

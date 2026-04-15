@@ -4,8 +4,9 @@ import csv
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
-#import wandb
+import wandb
 
 import torch
 import torch.distributed as dist
@@ -46,7 +47,7 @@ from utils import (
     FlowMatchScheduler
 )
 
-from dataset import MultiLatentLeRobotDataset
+from .dataset import MultiLatentLeRobotDataset
 import gc
 
 import gc
@@ -202,18 +203,45 @@ def _collate_pad_batch(batch):
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
+            api_key = os.environ.get("WANDB_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "enable_wandb=True but WANDB_API_KEY is not set. Export it or set enable_wandb=False."
+                )
+            base_url = os.environ.get("WANDB_BASE_URL", "https://api.wandb.ai")
+            wandb.login(host=base_url, key=api_key)
             self.wandb = wandb
-            self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
-                config=config,
-                mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
+            # 403 upsertBucket: entity 必须与 key 有写权限的 team/user 一致。
+            # 优先级: config.wandb_entity -> WANDB_ENTITY -> WANDB_TEAM_NAME；皆空则不传 entity，用 key 默认 workspace。
+            entity = (
+                getattr(config, "wandb_entity", None)
+                or os.environ.get("WANDB_ENTITY")
+                or os.environ.get("WANDB_TEAM_NAME")
             )
-            logger.info("WandB logging enabled")
+            project = (
+                getattr(config, "wandb_project", None)
+                or os.environ.get("WANDB_PROJECT", "va_robotwin")
+            )
+            run_name = (
+                getattr(config, "wandb_run_name", None)
+                or os.environ.get("WANDB_RUN_NAME", "train")
+            )
+            mode = os.environ.get("WANDB_MODE", "online")
+            init_kw = dict(
+                project=project,
+                config=config,
+                mode=mode,
+                name=run_name,
+            )
+            if entity:
+                init_kw["entity"] = entity
+            self.wandb.init(**init_kw)
+            logger.info(
+                "WandB enabled: project=%r, entity=%s, mode=%r",
+                project,
+                entity if entity else "<default from API key>",
+                mode,
+            )
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -240,10 +268,18 @@ class Trainer:
         )
 
         logger.info("Setting up activation checkpointing ...")
-        apply_ac(self.transformer)
+        apply_ac(
+            self.transformer,
+            inner_checkpoint_min_layer=int(
+                getattr(config, "ac_inner_checkpoint_min_layer", 10)
+            ),
+            checkpoint_attn2=bool(
+                getattr(config, "ac_checkpoint_attn2", True)
+            ),
+        )
 
         logger.info("Setting up FSDP...")
-        shard_fn = shard_model
+        shard_fn = partial(shard_model, param_dtype=self.dtype)
         self.transformer = _configure_model(
             model=self.transformer,
             shard_fn=shard_fn,
@@ -473,11 +509,15 @@ class Trainer:
             latent_dict['text_mask'] = batch_dict['text_mask']
             action_dict['text_mask'] = batch_dict['text_mask']
 
+        # window_size 上界影响 attention 激活峰值；默认与原先 randint(4,65) 一致（最大 64）
+        w_max_inc = int(getattr(self.config, "train_window_size_max", 64))
+        w_max_inc = max(4, min(64, w_max_inc))
+        w_hi_excl = w_max_inc + 1  # randint high exclusive → 取值 <= w_max_inc
         input_dict = {
             'latent_dict': latent_dict,
             'action_dict': action_dict,
             'chunk_size': torch.randint(1, 5, (1,)).item(),
-            'window_size': torch.randint(4, 65, (1,)).item(),
+            'window_size': torch.randint(4, w_hi_excl, (1,)).item(),
         }
         return input_dict
     # def _prepare_input_dict(self, batch_dict):
@@ -540,31 +580,63 @@ class Trainer:
         Bn, Fn = input_dict['latent_dict']['timesteps'].shape
         latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
         action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
-
-        # # Frame-wise video loss calculation
+        
+        
         latent_loss = F.mse_loss(
             latent_pred.float(),
             input_dict['latent_dict']['targets'].float().detach(),
             reduction='none'
-        )
+        )  # [B, C, F, H, W]
+
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
 
-        # 如果 batch 里有 latents_mask，就把 pad 出来的帧屏蔽掉
+        # 正确处理 latent mask：
+        # latents_mask 原始通常是 [B, 1, F, 1, 1]
+        # 需要 expand 成和 latent_loss 一样的形状，才能正确统计有效元素个数
         if 'latents_mask' in input_dict['latent_dict']:
-            latent_loss = latent_loss * input_dict['latent_dict']['latents_mask'].float()
-
-        latent_loss = latent_loss.permute(0, 2, 3, 4, 1)   # (B,C,F,H,W) -> (B,F,H,W,C)
-        latent_loss = latent_loss.flatten(0, 1).flatten(1) # (B*F, H*W*C)
-
-        if 'latents_mask' in input_dict['latent_dict']:
-            latent_mask = input_dict['latent_dict']['latents_mask'].float().permute(0, 2, 3, 4, 1)
-            latent_mask = latent_mask.flatten(0, 1).flatten(1)
-            latent_mask_per_frame = latent_mask.sum(dim=1)
+            latent_mask = input_dict['latent_dict']['latents_mask'].float()
+            latent_mask = latent_mask.expand_as(latent_loss)   # [B, C, F, H, W]
         else:
-            latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)
+            latent_mask = torch.ones_like(latent_loss)
 
-        latent_loss_per_frame = latent_loss.sum(dim=1)
+        # 先把无效位置清零
+        latent_loss = latent_loss * latent_mask
+
+        # 变成按帧统计
+        latent_loss = latent_loss.permute(0, 2, 3, 4, 1)   # [B, F, H, W, C]
+        latent_mask = latent_mask.permute(0, 2, 3, 4, 1)   # [B, F, H, W, C]
+
+        latent_loss = latent_loss.flatten(0, 1).flatten(1) # [B*F, H*W*C]
+        latent_mask = latent_mask.flatten(0, 1).flatten(1) # [B*F, H*W*C]
+
+        latent_loss_per_frame = latent_loss.sum(dim=1)      # [B*F]
+        latent_mask_per_frame = latent_mask.sum(dim=1)      # [B*F]
+
         latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+        # # # Frame-wise video loss calculation
+        # latent_loss = F.mse_loss(
+        #     latent_pred.float(),
+        #     input_dict['latent_dict']['targets'].float().detach(),
+        #     reduction='none'
+        # )
+        # latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
+
+        # # 如果 batch 里有 latents_mask，就把 pad 出来的帧屏蔽掉
+        # if 'latents_mask' in input_dict['latent_dict']:
+        #     latent_loss = latent_loss * input_dict['latent_dict']['latents_mask'].float()
+
+        # latent_loss = latent_loss.permute(0, 2, 3, 4, 1)   # (B,C,F,H,W) -> (B,F,H,W,C)
+        # latent_loss = latent_loss.flatten(0, 1).flatten(1) # (B*F, H*W*C)
+
+        # if 'latents_mask' in input_dict['latent_dict']:
+        #     latent_mask = input_dict['latent_dict']['latents_mask'].float().permute(0, 2, 3, 4, 1)
+        #     latent_mask = latent_mask.flatten(0, 1).flatten(1)
+        #     latent_mask_per_frame = latent_mask.sum(dim=1)
+        # else:
+        #     latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)
+
+        # latent_loss_per_frame = latent_loss.sum(dim=1)
+        # latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
         # latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
         # latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
         # # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)

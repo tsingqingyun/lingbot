@@ -18,6 +18,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from wan_va.configs import get_config
 from wan_va.dataset import MultiLatentLeRobotDataset
 from wan_va.modules.model import FlexAttnFunc
+from wan_va.train import _collate_pad_batch
 
 def to_python(x):
     if isinstance(x, torch.Tensor):
@@ -413,6 +414,7 @@ def main():
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.load_worker,
+        collate_fn=_collate_pad_batch,
     )
 
     print("=" * 80)

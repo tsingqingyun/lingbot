@@ -6,9 +6,9 @@ set -x
 umask 007
  
 NGPU=${NGPU:-"8"}
-MASTER_PORT=${MASTER_PORT:-"29501"}
+MASTER_PORT=${MASTER_PORT:-"29531"}
 PORT=${PORT:-"1106"}
-LOG_RANK=${LOG_RANK:-"0"}
+LOG_RANK=${LOG_RANK:-"0,1,2,3,4,5"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"} # robotwin_train, libero_train
 
@@ -17,10 +17,10 @@ if [ $# -ne 0 ]; then
     overrides="$*"
 fi
 
-export WANDB_API_KEY="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"
+export WANDB_API_KEY="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"
 export WANDB_BASE_URL="https://api.wandb.ai"
-export WANDB_TEAM_NAME="111"
-export WANDB_PROJECT="lingbot-va"
+export WANDB_TEAM_NAME="niejc27"
+export WANDB_PROJECT="lingbot_va"
 
 ## node setting
 num_gpu=${NGPU}

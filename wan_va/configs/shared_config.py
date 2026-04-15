@@ -8,7 +8,7 @@ va_shared_cfg.host = '0.0.0.0'
 va_shared_cfg.port = 29536
 
 va_shared_cfg.param_dtype = torch.bfloat16
-va_shared_cfg.save_root = './train_out'
+va_shared_cfg.save_root = './train_out_root'
 
 va_shared_cfg.patch_size = (1, 2, 2)
 
@@ -21,3 +21,6 @@ va_shared_cfg.cuda_mem_log_every = 1
 
 # torch.amp.autocast around forward; GradScaler is used only when param_dtype is float16.
 va_shared_cfg.use_amp = True
+
+# When inner activation checkpointing applies, also checkpoint cross-attn (attn2).
+va_shared_cfg.ac_checkpoint_attn2 = False

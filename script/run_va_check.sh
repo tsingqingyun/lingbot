@@ -13,7 +13,7 @@ set -x
 umask 007
 
 NGPU=${NGPU:-"8"}
-MASTER_PORT=${MASTER_PORT:-"29501"}
+MASTER_PORT=${MASTER_PORT:-"29531"}
 LOG_RANK=${LOG_RANK:-"0"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"}
 SAVE_DIR=${SAVE_DIR:-"./debug_check"}

@@ -26,6 +26,8 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
 try:
     from flash_attn_interface import flash_attn_func
 except:
@@ -42,13 +44,17 @@ def custom_sdpa(q, k, v, attn_mask=None):
         - None
         - or broadcastable to [B, H, Q, K]
         - additive mask: valid=0, invalid=-inf
+
+    Disables cuDNN / flash SDPA paths: fused MHA graphs can return
+    ``mha_graph->execute(...) is_good()==false`` on backward when combined
+    with activation checkpointing; the subsequent SavedTensorHooks assert is
+    a follow-on error.
     """
-    out = F.scaled_dot_product_attention(
-        q.transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
-        attn_mask=attn_mask,
-    )
+    qt = q.transpose(1, 2)
+    kt = k.transpose(1, 2)
+    vt = v.transpose(1, 2)
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+        out = F.scaled_dot_product_attention(qt, kt, vt, attn_mask=attn_mask)
     return out.transpose(1, 2)
     # out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
     #                                      v.transpose(1, 2))
@@ -1238,10 +1244,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         cross_attention_mask = None
         if use_cross_mask and ('text_mask' in latent_dict):
-            print("text_mask shape:", latent_dict["text_mask"].shape)
-            print("text_mask dtype:", latent_dict["text_mask"].dtype)
-            print("text_mask unique:", torch.unique(latent_dict["text_mask"]))
-            print("text_mask first row:", latent_dict["text_mask"][0, :64])
+            # print("text_mask shape:", latent_dict["text_mask"].shape)
+            # print("text_mask dtype:", latent_dict["text_mask"].dtype)
+            # print("text_mask unique:", torch.unique(latent_dict["text_mask"]))
+            # print("text_mask first row:", latent_dict["text_mask"][0, :64])
 
             cross_attention_mask = FlexAttnFunc.build_flattened_cross_attn_additive_mask(
                 seq_ids=FlexAttnFunc.seq_ids.to(hidden_states.device),
@@ -1250,13 +1256,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 dtype=hidden_states.dtype,
             )
 
-            print("cross mask shape:", cross_attention_mask.shape)
-            print("cross mask finite ratio:",
-                torch.isfinite(cross_attention_mask).float().mean())
-            print("cross mask row0 valid count:",
-                (cross_attention_mask[0, 0, 0] == 0).sum())
-            print("cross mask first padded row valid count:",
-                (cross_attention_mask[0, 0, -1] == 0).sum())
+            # print("cross mask shape:", cross_attention_mask.shape)
+            # print("cross mask finite ratio:",
+            #     torch.isfinite(cross_attention_mask).float().mean())
+            # print("cross mask row0 valid count:",
+            #     (cross_attention_mask[0, 0, 0] == 0).sum())
+            # print("cross mask first padded row valid count:",
+            #     (cross_attention_mask[0, 0, -1] == 0).sum())
 
         for block in self.blocks:
             hidden_states = block(

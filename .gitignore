@@ -54,3 +54,6 @@ debug_comprehensive_check/
 *.hdf5
 datasets/
 __pycache__/
+
+wandb/
+*.csv
