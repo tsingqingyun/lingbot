@@ -191,6 +191,37 @@ NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
 
 > **GPU Memory Requirements**: Approximately **18GB VRAM** for single-GPU i2av inference with offload mode enabled (VAE and text_encoder offloaded to CPU).
 
+### Evaluation on RoboCasa v1.0
+
+RoboCasa evaluation reuses the same LingBot-VA websocket inference server, but uses a dedicated RoboCasa client:
+
+```bash
+# server (single GPU)
+START_PORT=29056 MASTER_PORT=29061 \
+python -m torch.distributed.run --nproc_per_node 1 --master_port ${MASTER_PORT} \
+  wan_va/wan_va_server.py --config-name robocasa --port ${START_PORT} --save_root visualization/
+
+# client
+bash evaluation/robocasa/launch_client_robocasa.sh ./results_robocasa "robocasa/PickPlaceCounterToCabinet" 1
+```
+
+`--config-name robocasa` loads the built-in config at `wan_va/configs/va_robocasa_cfg.py`.
+
+You can also run the client directly for custom options:
+
+```bash
+python -m evaluation.robocasa.eval_policy_client_openpi \
+  --env_id "robocasa/PickPlaceCounterToCabinet" \
+  --split pretrain \
+  --n_episodes 1 \
+  --max_steps 500 \
+  --port 29056 \
+  --save_root ./results_robocasa
+```
+
+The client maps LingBot predicted channels back to RoboCasa 12D control actions using the built-in `lingbot_to_robocasa` mapping, and writes unified metrics to:
+`<save_root>/metrics/res.json`.
+
 
 ## Post-Training LingBot-VA
 
