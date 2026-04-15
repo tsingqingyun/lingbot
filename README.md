@@ -344,10 +344,11 @@ bash script/run_va_posttrain_deepspeed.sh
 You can override both `CONFIG_NAME` and `DEEPSPEED_CONFIG` from shell.  
 `gradient_accumulation_steps` used by DeepSpeed follows the JSON config (`deepspeed_config`) when enabled.
 The default ZeRO config uses conservative communication bucket sizes (`50000000`) for stability-first training.
+If you prioritize throughput and have stable networking, you can try increasing these bucket sizes gradually.
 
 For better training performance, use a larger global batch size (e.g., 32, 64). If you have limited GPU resources, you can increase `gradient_accumulation_steps` to achieve a larger effective batch size.
 
-> Note: current checkpoint saving keeps the same transformer weight export format; DeepSpeed optimizer/sharded states are not exported by `save_checkpoint()`. Resume behavior should follow your existing `resume_from` model-weight workflow.
+> Note: current checkpoint saving keeps the same transformer weight export format; DeepSpeed optimizer/sharded states are not exported by `save_checkpoint()`. Resuming with `resume_from` is therefore a warm restart from model weights (optimizer state is reinitialized).
 
 
 ---
