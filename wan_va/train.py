@@ -318,6 +318,12 @@ class Trainer:
                     ds_config["train_micro_batch_size_per_gpu"],
                     config.batch_size,
                 )
+            optimizer_offload_device = (
+                ds_config.get("zero_optimization", {})
+                .get("offload_optimizer", {})
+                .get("device", "")
+            )
+            use_fused_adamw = str(optimizer_offload_device).lower() != "cpu"
             self.transformer.to(device=self.device, dtype=self.dtype)
             self.transformer.train()
             self.transformer.requires_grad_(True)
@@ -327,7 +333,7 @@ class Trainer:
                 betas=(config.beta1, config.beta2),
                 eps=1e-8,
                 weight_decay=config.weight_decay,
-                fused=False,
+                fused=use_fused_adamw,
                 foreach=False,
             )
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(

@@ -14,7 +14,6 @@ if [ $# -ne 0 ]; then
     overrides="$*"
 fi
 
-export WANDB_API_KEY="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"
 export WANDB_BASE_URL="https://api.wandb.ai"
 export WANDB_TEAM_NAME="niejc27"
 export WANDB_PROJECT="lingbot_va"
