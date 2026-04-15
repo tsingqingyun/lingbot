@@ -202,7 +202,9 @@ On top of the base installation, post-training requires:
 
 ```bash
 pip install lerobot==0.3.3 scipy wandb --no-deps
+pip install deepspeed
 ```
+(`pip install deepspeed` uses the latest compatible release by default.)
 
 ### Data Preparation
 
@@ -325,11 +327,28 @@ The latent file naming convention `episode_{index}_{start_frame}_{end_frame}.pth
 
 ### Training
 
+Torch distributed (existing path):
+
 ```bash
 NGPU=8 bash script/run_va_posttrain.sh
 ```
 
+DeepSpeed + ZeRO-2 Offload (new path):
+
+```bash
+NGPU=8 CONFIG_NAME=robocasa_train \
+DEEPSPEED_CONFIG=wan_va/configs/deepspeed/zero2_offload.json \
+bash script/run_va_posttrain_deepspeed.sh
+```
+
+You can override both `CONFIG_NAME` and `DEEPSPEED_CONFIG` from shell.  
+`gradient_accumulation_steps` used by DeepSpeed follows the JSON config (`deepspeed_config`) when enabled.
+The default ZeRO config uses conservative communication bucket sizes (`50000000`) for stability-first training.
+If you prioritize throughput and have stable networking, you can try increasing these bucket sizes gradually.
+
 For better training performance, use a larger global batch size (e.g., 32, 64). If you have limited GPU resources, you can increase `gradient_accumulation_steps` to achieve a larger effective batch size.
+
+> Note: current checkpoint saving keeps the same transformer weight export format; DeepSpeed optimizer/sharded states are not exported by `save_checkpoint()`. Resuming with `resume_from` is therefore a warm restart from model weights (optimizer state is reinitialized).
 
 
 ---
