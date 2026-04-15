@@ -247,6 +247,10 @@ class Trainer:
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
+        self.use_deepspeed = bool(getattr(config, "use_deepspeed", False))
+        self.gradient_accumulation_steps = int(
+            getattr(config, "gradient_accumulation_steps", 1)
+        )
 
         # Load models
         logger.info("Loading models...")
@@ -278,31 +282,101 @@ class Trainer:
             ),
         )
 
-        logger.info("Setting up FSDP...")
-        shard_fn = partial(shard_model, param_dtype=self.dtype)
-        self.transformer = _configure_model(
-            model=self.transformer,
-            shard_fn=shard_fn,
-            param_dtype=self.dtype,
-            device=self.device,
-            eval_mode=False,
-        )
-        self.transformer.train()
-        self.transformer.requires_grad_(True)
+        logger.info("Setting up distributed training wrapper...")
+        if self.use_deepspeed:
+            try:
+                import deepspeed
+            except ImportError as e:
+                raise RuntimeError(
+                    "DeepSpeed is enabled but not installed. "
+                    "Please run `pip install deepspeed`."
+                ) from e
+            if not torch.cuda.is_available():
+                raise RuntimeError("DeepSpeed training requires CUDA.")
 
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(
-            [p for p in self.transformer.parameters() if p.requires_grad],
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            eps=1e-8,
-            weight_decay=config.weight_decay,
-            fused=True,
-            foreach=False,
-        )
-
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
-            lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
+            ds_config_path = getattr(config, "deepspeed_config", None)
+            if not ds_config_path:
+                raise ValueError(
+                    "DeepSpeed is enabled but `deepspeed_config` is not set."
+                )
+            ds_config_path = os.path.abspath(str(ds_config_path))
+            if not os.path.exists(ds_config_path):
+                raise FileNotFoundError(
+                    f"DeepSpeed config file not found: {ds_config_path}"
+                )
+            with open(ds_config_path, "r") as f:
+                ds_config = json.load(f)
+            ds_config.setdefault("train_micro_batch_size_per_gpu", int(config.batch_size))
+            ds_config.setdefault(
+                "gradient_accumulation_steps",
+                int(getattr(config, "gradient_accumulation_steps", 1)),
+            )
+            if int(ds_config["train_micro_batch_size_per_gpu"]) != int(config.batch_size):
+                logger.warning(
+                    "DeepSpeed micro batch size (%s) != config.batch_size (%s). "
+                    "DataLoader uses config.batch_size.",
+                    ds_config["train_micro_batch_size_per_gpu"],
+                    config.batch_size,
+                )
+            self.transformer.to(device=self.device, dtype=self.dtype)
+            self.transformer.train()
+            self.transformer.requires_grad_(True)
+            self.optimizer = torch.optim.AdamW(
+                [p for p in self.transformer.parameters() if p.requires_grad],
+                lr=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                eps=1e-8,
+                weight_decay=config.weight_decay,
+                fused=False,
+                foreach=False,
+            )
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=lambda step: warmup_constant_lambda(
+                    step, warmup_steps=config.warmup_steps
+                ),
+            )
+            self.transformer, self.optimizer, _, self.lr_scheduler = deepspeed.initialize(
+                model=self.transformer,
+                model_parameters=[p for p in self.transformer.parameters() if p.requires_grad],
+                optimizer=self.optimizer,
+                lr_scheduler=self.lr_scheduler,
+                config=ds_config,
+                dist_init_required=False,
+            )
+            ds_accum = getattr(self.transformer, "gradient_accumulation_steps", None)
+            if ds_accum is not None:
+                self.gradient_accumulation_steps = int(
+                    ds_accum() if callable(ds_accum) else ds_accum
+                )
+            if config.rank == 0:
+                logger.info(f"DeepSpeed enabled, config: {ds_config_path}")
+                logger.info(
+                    "DeepSpeed grad accumulation steps: %s",
+                    self.gradient_accumulation_steps,
+                )
+        else:
+            shard_fn = partial(shard_model, param_dtype=self.dtype)
+            self.transformer = _configure_model(
+                model=self.transformer,
+                shard_fn=shard_fn,
+                param_dtype=self.dtype,
+                device=self.device,
+                eval_mode=False,
+            )
+            self.transformer.train()
+            self.transformer.requires_grad_(True)
+            self.optimizer = torch.optim.AdamW(
+                [p for p in self.transformer.parameters() if p.requires_grad],
+                lr=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                eps=1e-8,
+                weight_decay=config.weight_decay,
+                fused=True,
+                foreach=False,
+            )
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
+                lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
@@ -363,7 +437,6 @@ class Trainer:
             if config.rank == 0:
                 logger.info(f"CUDA memory stats CSV (per rank): pattern {raw}")
 
-        self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
 
         self._use_amp = bool(getattr(config, "use_amp", True)) and torch.cuda.is_available()
@@ -668,10 +741,11 @@ class Trainer:
 
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
 
-        if not should_sync:
-            self.transformer.set_requires_gradient_sync(False)
-        else:
-            self.transformer.set_requires_gradient_sync(True)
+        if not self.use_deepspeed:
+            if not should_sync:
+                self.transformer.set_requires_gradient_sync(False)
+            else:
+                self.transformer.set_requires_gradient_sync(True)
 
         if self._cuda_mem_log_writer is not None and batch_idx == 0:
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -691,7 +765,10 @@ class Trainer:
         if self.step < 3 and batch_idx == 0:
             self.report_cuda_mem("after forward")
 
-        if self._use_fp16_scaler:
+        if self.use_deepspeed:
+            should_sync = self.transformer.is_gradient_accumulation_boundary()
+            self.transformer.backward(loss)
+        elif self._use_fp16_scaler:
             self._grad_scaler.scale(loss).backward()
         else:
             loss.backward()
@@ -704,7 +781,19 @@ class Trainer:
             'action_loss': action_loss.detach(),
         }
 
-        if should_sync:
+        if self.use_deepspeed:
+            self.transformer.step()
+            if should_sync:
+                total_norm = self.transformer.get_global_grad_norm()
+                if total_norm is None:
+                    total_norm = torch.tensor(float("nan"), device=self.device)
+                elif not isinstance(total_norm, torch.Tensor):
+                    total_norm = torch.tensor(float(total_norm), device=self.device)
+                losses['total_norm'] = total_norm.detach()
+                losses['should_log'] = True
+            else:
+                losses['should_log'] = False
+        elif should_sync:
             if self._use_fp16_scaler:
                 self._grad_scaler.unscale_(self.optimizer)
             total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
@@ -812,10 +901,21 @@ class Trainer:
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
         try:
-            state_dict = get_model_state_dict(
-                self.transformer,
-                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            )
+            if self.use_deepspeed:
+                transformer_module = (
+                    self.transformer.module
+                    if hasattr(self.transformer, "module")
+                    else self.transformer
+                )
+                state_dict = {
+                    k: v.detach().cpu()
+                    for k, v in transformer_module.state_dict().items()
+                }
+            else:
+                state_dict = get_model_state_dict(
+                    self.transformer,
+                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+                )
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
             # optim_state = get_optimizer_state_dict(
             #         self.transformer, self.optimizer,
@@ -914,7 +1014,10 @@ class Trainer:
             initial=self.step
         )
 
-        self.optimizer.zero_grad()
+        if self.use_deepspeed:
+            self.transformer.zero_grad()
+        else:
+            self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
         step_in_accumulation = 0
@@ -932,7 +1035,10 @@ class Trainer:
 
             # Log and checkpoint when optimizer steps
             if losses['should_log']:
-                lr = self.lr_scheduler.get_last_lr()[0]
+                if self.lr_scheduler is not None and hasattr(self.lr_scheduler, "get_last_lr"):
+                    lr = self.lr_scheduler.get_last_lr()[0]
+                else:
+                    lr = self.optimizer.param_groups[0]["lr"]
 
                 # Average accumulated losses
                 latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
@@ -995,6 +1101,13 @@ class Trainer:
 def run(args):
     """Main entry point."""
     config = get_config(args.config_name)
+    config.use_deepspeed = bool(args.use_deepspeed)
+    if args.deepspeed_config is not None:
+        config.deepspeed_config = args.deepspeed_config
+    elif config.use_deepspeed and not getattr(config, "deepspeed_config", None):
+        config.deepspeed_config = str(
+            Path(__file__).resolve().parent / "configs" / "deepspeed" / "zero2_offload.json"
+        )
 
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -1031,6 +1144,17 @@ def main():
         type=str,
         default=None,
         help="Root directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--use-deepspeed",
+        action="store_true",
+        help="Enable DeepSpeed training path (disable FSDP path).",
+    )
+    parser.add_argument(
+        "--deepspeed-config",
+        type=str,
+        default=None,
+        help="DeepSpeed JSON config path. Used when --use-deepspeed is set.",
     )
 
     args = parser.parse_args()
