@@ -204,6 +204,7 @@ On top of the base installation, post-training requires:
 pip install lerobot==0.3.3 scipy wandb --no-deps
 pip install deepspeed
 ```
+(`pip install deepspeed` uses the latest compatible release by default.)
 
 ### Data Preparation
 
@@ -342,6 +343,7 @@ bash script/run_va_posttrain_deepspeed.sh
 
 You can override both `CONFIG_NAME` and `DEEPSPEED_CONFIG` from shell.  
 `gradient_accumulation_steps` used by DeepSpeed follows the JSON config (`deepspeed_config`) when enabled.
+The default ZeRO config uses conservative communication bucket sizes (`50000000`) for stability-first training.
 
 For better training performance, use a larger global batch size (e.g., 32, 64). If you have limited GPU resources, you can increase `gradient_accumulation_steps` to achieve a larger effective batch size.
 
