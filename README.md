@@ -196,13 +196,21 @@ NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
 RoboCasa evaluation reuses the same LingBot-VA websocket inference server, but uses a dedicated RoboCasa client:
 
 ```bash
+# optional: override model checkpoints used by --config-name robocasa
+export LINGBOT_ROBOCASA_MODEL_PATH=/path/to/checkpoint_step_xxx
+export LINGBOT_WAN_BASE_PATH=/path/to/wan22_root
+
 # server (single GPU)
 START_PORT=29056 MASTER_PORT=29061 \
 python -m torch.distributed.run --nproc_per_node 1 --master_port ${MASTER_PORT} \
   wan_va/wan_va_server.py --config-name robocasa --port ${START_PORT} --save_root visualization/
 
-# client
-bash evaluation/robocasa/launch_client_robocasa.sh ./results_robocasa "robocasa/PickPlaceCounterToCabinet" 1
+# client (recommended: point to your RoboCasa datasets base path)
+bash evaluation/robocasa/launch_client_robocasa.sh \
+  ./results_robocasa \
+  "robocasa/PickPlaceCounterToCabinet" \
+  1 \
+  /cephfs/shared/xcxhx/robocasa_datasets_composite
 ```
 
 `--config-name robocasa` loads the built-in config at `wan_va/configs/va_robocasa_cfg.py`.
@@ -216,6 +224,7 @@ python -m evaluation.robocasa.eval_policy_client_openpi \
   --n_episodes 1 \
   --max_steps 500 \
   --port 29056 \
+  --dataset_base_path /cephfs/shared/xcxhx/robocasa_datasets_composite \
   --save_root ./results_robocasa
 ```
 
