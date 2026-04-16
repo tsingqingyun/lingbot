@@ -6,10 +6,16 @@ n_episodes=${3:-1}
 dataset_base_path=${4:-${ROBOCASA_DATASET_BASE_PATH:-""}}
 PORT=${PORT:-29056}
 seed=${SEED:-0}
+DISABLE_ENV_CHECKER=${DISABLE_ENV_CHECKER:-1}
 
 extra_dataset_args=()
 if [ -n "${dataset_base_path}" ]; then
   extra_dataset_args+=(--dataset_base_path "${dataset_base_path}")
+fi
+if [ "${DISABLE_ENV_CHECKER}" = "1" ]; then
+  extra_dataset_args+=(--disable_env_checker)
+else
+  extra_dataset_args+=(--enable_env_checker)
 fi
 
 python -m evaluation.robocasa.eval_policy_client_openpi \

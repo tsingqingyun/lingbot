@@ -118,7 +118,13 @@ def infer_success(info: Dict, terminated: bool) -> bool:
     return bool(terminated)
 
 
-def create_env(env_id: str, split: str, seed: Optional[int], render_mode: Optional[str]):
+def create_env(
+    env_id: str,
+    split: str,
+    seed: Optional[int],
+    render_mode: Optional[str],
+    disable_env_checker: bool = True,
+):
     import gymnasium as gym
     import robocasa  # noqa: F401  # import required to register robocasa/* env IDs with gymnasium
 
@@ -127,7 +133,7 @@ def create_env(env_id: str, split: str, seed: Optional[int], render_mode: Option
         kwargs["seed"] = seed
     if render_mode is not None:
         kwargs["render_mode"] = render_mode
-    return gym.make(env_id, **kwargs)
+    return gym.make(env_id, disable_env_checker=disable_env_checker, **kwargs)
 
 
 def _normalize_dataset_base_path(dataset_base_path: str) -> str:
@@ -282,6 +288,19 @@ def parse_args():
     parser.add_argument("--action_guidance_scale", type=float, default=1.0)
     parser.add_argument("--save_video", action="store_true")
     parser.add_argument("--render_mode", type=str, default=None)
+    parser.add_argument(
+        "--disable_env_checker",
+        dest="disable_env_checker",
+        action="store_true",
+        default=True,
+        help="Disable Gymnasium passive env checker (default: enabled for compatibility).",
+    )
+    parser.add_argument(
+        "--enable_env_checker",
+        dest="disable_env_checker",
+        action="store_false",
+        help="Enable Gymnasium passive env checker for strict env-space validation.",
+    )
     return parser.parse_args()
 
 
@@ -305,7 +324,13 @@ def main():
 
     for ep in range(args.n_episodes):
         env_seed = args.seed + ep
-        env = create_env(args.env_id, split=args.split, seed=env_seed, render_mode=args.render_mode)
+        env = create_env(
+            args.env_id,
+            split=args.split,
+            seed=env_seed,
+            render_mode=args.render_mode,
+            disable_env_checker=args.disable_env_checker,
+        )
         try:
             if args.prompt:
                 episode_prompt = args.prompt
