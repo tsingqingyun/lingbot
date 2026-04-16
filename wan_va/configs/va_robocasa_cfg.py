@@ -6,7 +6,12 @@ from .shared_config import va_shared_cfg
 va_robocasa_cfg = EasyDict(__name__='Config: VA robocasa')
 va_robocasa_cfg.update(va_shared_cfg)
 
-va_robocasa_cfg.wan22_pretrained_model_name_or_path = "/cephfs/shared/xcx/lingbot-va/train_out_1/checkpoints/checkpoint_step_9000"
+# Trained checkpoint root (must contain subdirectory transformer/).
+va_robocasa_cfg.wan22_pretrained_model_name_or_path = (
+    "/cephfs/shared/xcx/lingbot-va/train_out_1/checkpoints/checkpoint_step_9000"
+)
+# Full Wan tree: vae/, tokenizer/, text_encoder/.
+va_robocasa_cfg.wan22_base_pretrained_model_name_or_path = "/cephfs/shared/xcxhx/lingbot-va"
     
 va_robocasa_cfg.attn_window = 72
 va_robocasa_cfg.frame_chunk_size = 2
