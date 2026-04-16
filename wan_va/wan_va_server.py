@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from configs import VA_CONFIGS
+from configs import get_config
 from distributed.fsdp import shard_model
 from distributed.util import _configure_model, init_distributed
 from modules.utils import (
@@ -675,7 +675,7 @@ class VA_Server:
 
 def run(args):    
     
-    config = VA_CONFIGS[args.config_name]
+    config = get_config(args.config_name)
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
