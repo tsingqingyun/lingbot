@@ -186,11 +186,11 @@ def run_episode(
                 break
 
         if key_frame_list:
-            expected_cache_frames = int(pred.shape[1])
+            required_frame_count = pred.shape[1]
             cache_frames = list(key_frame_list)
-            if len(cache_frames) < expected_cache_frames:
-                while len(cache_frames) < expected_cache_frames:
-                    cache_frames.insert(0, server_obs)
+            if len(cache_frames) < required_frame_count:
+                padding_count = required_frame_count - len(cache_frames)
+                cache_frames = [server_obs] * padding_count + cache_frames
 
             model.infer(
                 dict(obs=cache_frames, compute_kv_cache=True, imagine=False, state=pred)
