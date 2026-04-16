@@ -76,6 +76,7 @@ class WanVAEStreamingWrapper:
         self.vae = vae_model
         self.encoder = vae_model.encoder
         self.quant_conv = vae_model.quant_conv
+        self.min_temporal_frames = 1
 
         if hasattr(self.vae, "_cached_conv_counts"):
             self.enc_conv_num = self.vae._cached_conv_counts["encoder"]
@@ -85,6 +86,13 @@ class WanVAEStreamingWrapper:
                 if m.__class__.__name__ == "WanCausalConv3d":
                     count += 1
             self.enc_conv_num = count
+        for m in self.encoder.modules():
+            if not isinstance(m, torch.nn.Conv3d):
+                continue
+            kernel_size = m.kernel_size
+            if isinstance(kernel_size, tuple) and len(kernel_size) == 3:
+                self.min_temporal_frames = max(self.min_temporal_frames,
+                                               int(kernel_size[0]))
 
         self.clear_cache()
 
@@ -92,6 +100,11 @@ class WanVAEStreamingWrapper:
         self.feat_cache = [None] * self.enc_conv_num
 
     def encode_chunk(self, x_chunk):
+        original_frames = x_chunk.shape[2]
+        if original_frames < self.min_temporal_frames:
+            pad_frames = self.min_temporal_frames - original_frames
+            head = x_chunk[:, :, :1].repeat(1, 1, pad_frames, 1, 1)
+            x_chunk = torch.cat([head, x_chunk], dim=2)
         if hasattr(self.vae.config,
                    "patch_size") and self.vae.config.patch_size is not None:
             x_chunk = patchify(x_chunk, self.vae.config.patch_size)
@@ -100,4 +113,7 @@ class WanVAEStreamingWrapper:
                            feat_cache=self.feat_cache,
                            feat_idx=feat_idx)
         enc = self.quant_conv(out)
+        if original_frames < self.min_temporal_frames:
+            # Drop prefix outputs introduced by temporal head-padding.
+            enc = enc[:, :, -original_frames:]
         return enc
