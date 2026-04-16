@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import copy
 import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -186,11 +187,11 @@ def run_episode(
                 break
 
         if key_frame_list:
-            required_frame_count = pred.shape[1]
+            min_kv_cache_frames = pred.shape[1]
             cache_frames = list(key_frame_list)
-            if len(cache_frames) < required_frame_count:
-                padding_count = required_frame_count - len(cache_frames)
-                cache_frames = [server_obs] * padding_count + cache_frames
+            if len(cache_frames) < min_kv_cache_frames:
+                padding_count = min_kv_cache_frames - len(cache_frames)
+                cache_frames = [copy.deepcopy(server_obs) for _ in range(padding_count)] + cache_frames
 
             model.infer(
                 dict(obs=cache_frames, compute_kv_cache=True, imagine=False, state=pred)
