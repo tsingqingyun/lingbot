@@ -186,8 +186,16 @@ def run_episode(
                 break
 
         if key_frame_list:
-            model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=pred))
-            next_frame = key_frame_list[-1]
+            expected_cache_frames = int(pred.shape[1])
+            cache_frames = list(key_frame_list)
+            if len(cache_frames) < expected_cache_frames:
+                while len(cache_frames) < expected_cache_frames:
+                    cache_frames.insert(0, server_obs)
+
+            model.infer(
+                dict(obs=cache_frames, compute_kv_cache=True, imagine=False, state=pred)
+            )
+            next_frame = cache_frames[-1]
         else:
             next_frame = frame
         first = False
