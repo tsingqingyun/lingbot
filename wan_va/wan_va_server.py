@@ -85,10 +85,13 @@ class VA_Server:
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
+        # flex self-attn needs FlexAttnFunc.init_mask, which inference forward does not call.
+        inference_attn = getattr(self.job_config, "inference_attn_mode", "torch")
         self.transformer = load_transformer(
             os.path.join(wan_transformer_root, 'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
+            attn_mode=inference_attn,
         )
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,

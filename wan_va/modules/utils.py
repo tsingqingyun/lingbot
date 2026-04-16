@@ -42,12 +42,19 @@ def load_transformer(
     transformer_path,
     torch_dtype,
     torch_device,
+    attn_mode=None,
 ):
-    model = WanTransformer3DModel.from_pretrained(
-        transformer_path,
+    """Load Wan transformer. If ``attn_mode`` is set, it overrides the checkpoint
+    (e.g. ``torch`` for websocket inference: ``flex`` requires ``FlexAttnFunc.init_mask``
+    which is only invoked on the training forward path today).
+    """
+    kwargs = dict(
         torch_dtype=torch_dtype,
         device_map=None,
     )
+    if attn_mode is not None:
+        kwargs["attn_mode"] = attn_mode
+    model = WanTransformer3DModel.from_pretrained(transformer_path, **kwargs)
     return model.to(torch_device)
 
 

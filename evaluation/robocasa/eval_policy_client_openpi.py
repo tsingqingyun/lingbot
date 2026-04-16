@@ -4,6 +4,7 @@
 import argparse
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -17,16 +18,19 @@ from wan_va.dataset.lerobot_latent_dataset import lingbot_to_robocasa
 DEFAULT_OBS_KEY_CANDIDATES = {
     "observation.images.robot0_agentview_left": (
         "observation.images.robot0_agentview_left",
+        "video.robot0_agentview_left",
         "robot0_agentview_left_image",
         "agentview_left_image",
     ),
     "observation.images.robot0_agentview_right": (
         "observation.images.robot0_agentview_right",
+        "video.robot0_agentview_right",
         "robot0_agentview_right_image",
         "agentview_right_image",
     ),
     "observation.images.robot0_eye_in_hand": (
         "observation.images.robot0_eye_in_hand",
+        "video.robot0_eye_in_hand",
         "robot0_eye_in_hand_image",
         "robot0_wrist_image",
         "eye_in_hand_image",
@@ -88,6 +92,21 @@ def used_channels_to_action30(action_used: np.ndarray) -> np.ndarray:
     return action_30
 
 
+def robocasa_action12_to_gym_dict(action_12: np.ndarray) -> Dict[str, np.ndarray]:
+    """RoboCasa 12D flat action -> ``spaces.Dict`` keys for ``RoboCasaGymEnv.step``."""
+    a = np.asarray(action_12, dtype=np.float32).reshape(-1)
+    if a.shape[0] != 12:
+        raise ValueError(f"Expected RoboCasa action dim 12, got shape {getattr(action_12, 'shape', None)}")
+    # Same layout as ``wan_va.dataset.lerobot_latent_dataset.robocasa_to_lingbot``.
+    return {
+        "action.end_effector_position": a[0:3].copy(),
+        "action.end_effector_rotation": a[3:6].copy(),
+        "action.gripper_close": a[6:7].copy(),
+        "action.base_motion": a[7:11].copy(),
+        "action.control_mode": a[11:12].copy(),
+    }
+
+
 def infer_success(info: Dict, terminated: bool) -> bool:
     for key in ("success", "task_success", "is_success", "episode_success"):
         if key in info:
@@ -109,6 +128,35 @@ def create_env(env_id: str, split: str, seed: Optional[int], render_mode: Option
     if render_mode is not None:
         kwargs["render_mode"] = render_mode
     return gym.make(env_id, **kwargs)
+
+
+def _normalize_dataset_base_path(dataset_base_path: str) -> str:
+    """
+    RoboCasa registry paths already include "v1.0/...".
+    If user provides ".../v1.0", convert to its parent to avoid duplicated "v1.0/v1.0".
+    """
+    p = Path(dataset_base_path).expanduser().resolve()
+    if p.name == "v1.0":
+        return str(p.parent)
+    return str(p)
+
+
+def configure_robocasa_dataset_path(dataset_base_path: Optional[str]) -> Optional[str]:
+    """
+    Priority:
+      1) explicit --dataset_base_path
+      2) env ROBOCASA_DATASET_BASE_PATH
+      3) keep RoboCasa default behavior
+    """
+    candidate = dataset_base_path or os.environ.get("ROBOCASA_DATASET_BASE_PATH")
+    if not candidate:
+        return None
+
+    normalized = _normalize_dataset_base_path(candidate)
+    import robocasa.macros as macros
+
+    macros.DATASET_BASE_PATH = normalized
+    return normalized
 
 
 def run_episode(
@@ -161,9 +209,11 @@ def run_episode(
         key_frame_list = []
         start_idx = 1 if first else 0
         for i in range(start_idx, action_12_seq.shape[0]):
+            stepped = False
             for j in range(action_12_seq.shape[1]):
+                stepped = True
                 action_12 = action_12_seq[i, j]
-                step_out = env.step(action_12)
+                step_out = env.step(robocasa_action12_to_gym_dict(action_12))
                 if len(step_out) == 5:
                     obs, _, terminated, truncated, info = step_out
                     done = bool(terminated or truncated)
@@ -177,12 +227,12 @@ def run_episode(
                 frame = format_obs_for_lingbot(obs)
                 frames_for_video.append(frame["observation.images.robot0_agentview_left"])
 
-                is_last_in_horizon = (j + 1) == action_12_seq.shape[1]
-                if is_last_in_horizon:
-                    key_frame_list.append(frame)
-
                 if done or step_count >= max_steps:
                     break
+            # One lingbot-format obs per chunk frame (after j sub-steps for index i).
+            if stepped:
+                key_frame_list.append(frame)
+
             if done or step_count >= max_steps:
                 break
 
@@ -194,7 +244,12 @@ def run_episode(
                 cache_frames = [copy.deepcopy(server_obs) for _ in range(padding_count)] + cache_frames
 
             model.infer(
-                dict(obs=cache_frames, compute_kv_cache=True, imagine=False, state=pred)
+                dict(
+                    obs=cache_frames,
+                    compute_kv_cache=True,
+                    imagine=False,
+                    state=np.asarray(pred, dtype=np.float32),
+                )
             )
             next_frame = cache_frames[-1]
         else:
@@ -214,6 +269,15 @@ def parse_args():
     parser.add_argument("--port", type=int, default=29056)
     parser.add_argument("--save_root", type=str, default="results_robocasa")
     parser.add_argument("--prompt", type=str, default="")
+    parser.add_argument(
+        "--dataset_base_path",
+        type=str,
+        default=None,
+        help=(
+            "RoboCasa dataset base path. Can be either '<base>' (contains v1.0/) "
+            "or '<base>/v1.0'. If omitted, tries ROBOCASA_DATASET_BASE_PATH."
+        ),
+    )
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=1.0)
     parser.add_argument("--save_video", action="store_true")
@@ -223,6 +287,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    resolved_dataset_base_path = configure_robocasa_dataset_path(args.dataset_base_path)
+    if resolved_dataset_base_path is not None:
+        print(f"[Info] RoboCasa DATASET_BASE_PATH set to: {resolved_dataset_base_path}")
+
     save_root = Path(args.save_root)
     metrics_dir = save_root / "metrics"
     video_dir = save_root / "visualization"
@@ -290,6 +358,8 @@ def main():
         "success_rate": (succ / args.n_episodes) if args.n_episodes > 0 else 0.0,
         "episodes": episode_metrics,
     }
+    if resolved_dataset_base_path is not None:
+        out["dataset_base_path"] = resolved_dataset_base_path
     out_file = metrics_dir / "res.json"
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
