@@ -293,7 +293,7 @@ def parse_args():
         dest="disable_env_checker",
         action="store_true",
         default=True,
-        help="Disable Gymnasium passive env checker (default: enabled for compatibility).",
+        help="Disable Gymnasium passive env checker (default: disabled for compatibility).",
     )
     parser.add_argument(
         "--enable_env_checker",

@@ -12,9 +12,7 @@ extra_dataset_args=()
 if [ -n "${dataset_base_path}" ]; then
   extra_dataset_args+=(--dataset_base_path "${dataset_base_path}")
 fi
-if [ "${DISABLE_ENV_CHECKER}" = "1" ]; then
-  extra_dataset_args+=(--disable_env_checker)
-else
+if [ "${DISABLE_ENV_CHECKER}" = "0" ]; then
   extra_dataset_args+=(--enable_env_checker)
 fi
 
