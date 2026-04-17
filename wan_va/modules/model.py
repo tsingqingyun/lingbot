@@ -419,6 +419,18 @@ class FlexAttnFunc(nn.Module):
         valid_q = (seq_ids[:, None] >= 0)
         valid = same_batch & valid_q & text_valid_flat[None, :]
 
+        # Padding queries (seq_id < 0) would otherwise get an all -inf row, which
+        # can produce NaNs in some SDPA kernels. Route them to one valid text token.
+        pad_q = seq_ids < 0
+        if pad_q.any():
+            valid_token_idx = torch.nonzero(text_valid_flat, as_tuple=False)
+            if valid_token_idx.numel() > 0:
+                safe_col = int(valid_token_idx[0, 0].item())
+            else:
+                safe_col = 0
+            valid[pad_q, :] = False
+            valid[pad_q, safe_col] = True
+
         neg_inf = torch.finfo(dtype).min
         attn_mask = torch.full(
             (1, 1, q_len, B * K),

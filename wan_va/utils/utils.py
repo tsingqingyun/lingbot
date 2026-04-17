@@ -88,5 +88,7 @@ def sample_timestep_id(
 
 def warmup_constant_lambda(current_step, warmup_steps=1000):
     if current_step < warmup_steps:
-        return float(current_step) / float(max(1, warmup_steps))
+        # LambdaLR is stepped after optimizer.step(); using current_step+1 avoids
+        # an immediate zero-lr update on the first scheduler step.
+        return float(current_step + 1) / float(max(1, warmup_steps))
     return 1.0

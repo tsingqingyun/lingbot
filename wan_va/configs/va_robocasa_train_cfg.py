@@ -8,7 +8,10 @@ va_robocasa_train_cfg.update(va_robocasa_cfg)
 
 # va_robotwin_train_cfg.resume_from = '/robby/share/Robotics/lilin1/code/Wan_VA_Release/train_out/checkpoints/checkpoint_step_10'
 
-va_robocasa_train_cfg.dataset_path = '/root/lingbot_va/robocasa_datasets_composite'
+va_robocasa_train_cfg.dataset_path = os.environ.get(
+    "LINGBOT_ROBOCASA_DATASET_PATH",
+    '/root/lingbot_va/robocasa_datasets_composite',
+)
 va_robocasa_train_cfg.task_names = [
     'StoreLeftoversInBowl',
    'LoadDishwasher',
@@ -16,13 +19,13 @@ va_robocasa_train_cfg.task_names = [
     'SearingMeat',
 ]
 va_robocasa_train_cfg.empty_emb_path = os.path.join(va_robocasa_train_cfg.dataset_path, 'empty_emb.pt')
-va_robocasa_train_cfg.enable_wandb = True
+va_robocasa_train_cfg.enable_wandb = os.environ.get("LINGBOT_ENABLE_WANDB", "1").strip() not in ("0", "false", "False")
 # 若 403：在网页端确认 team slug，与下面一致；或注释掉三行仅用环境变量 / 仅用 key 默认 entity。
 # va_robocasa_train_cfg.wandb_entity = "your-team-or-username"
 # va_robocasa_train_cfg.wandb_project = "lingbot-va"
 # va_robocasa_train_cfg.wandb_run_name = "robocasa_train"
 va_robocasa_train_cfg.load_worker = 16
-va_robocasa_train_cfg.save_interval = 1000
+va_robocasa_train_cfg.save_interval = 100
 va_robocasa_train_cfg.gc_interval = 50
 va_robocasa_train_cfg.cfg_prob = 0.1
 

@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import copy
 import os
 import sys
 import time
@@ -17,7 +18,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from configs import VA_CONFIGS
+from configs import get_config
 from distributed.fsdp import shard_model
 from distributed.util import _configure_model, init_distributed
 from modules.utils import (
@@ -48,6 +49,18 @@ class VA_Server:
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
+        # VAE / tokenizer / text_encoder root (full Wan tree). If unset, same as transformer root.
+        wan_aux_root = getattr(job_config, "wan22_base_pretrained_model_name_or_path", None) or (
+            job_config.wan22_pretrained_model_name_or_path
+        )
+        wan_transformer_root = job_config.wan22_pretrained_model_name_or_path
+        if wan_aux_root != wan_transformer_root:
+            logger.info(
+                "Loading VAE/tokenizer/text_encoder from %s; transformer from %s",
+                wan_aux_root,
+                wan_transformer_root,
+            )
+
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
                                             extra_one_step=True)
@@ -59,29 +72,27 @@ class VA_Server:
         self.action_scheduler.set_timesteps(1000, training=True)
 
         self.vae = load_vae(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'vae'),
+            os.path.join(wan_aux_root, 'vae'),
             torch_dtype=self.dtype,
             torch_device='cpu' if self.enable_offload else self.device,
         )
         self.streaming_vae = WanVAEStreamingWrapper(self.vae)
 
-        self.tokenizer = load_tokenizer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'tokenizer'), )
+        self.tokenizer = load_tokenizer(os.path.join(wan_aux_root, 'tokenizer'))
 
         self.text_encoder = load_text_encoder(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'text_encoder'),
+            os.path.join(wan_aux_root, 'text_encoder'),
             torch_dtype=self.dtype,
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
+        # flex self-attn needs FlexAttnFunc.init_mask, which inference forward does not call.
+        inference_attn = getattr(self.job_config, "inference_attn_mode", "torch")
         self.transformer = load_transformer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'transformer'),
+            os.path.join(wan_transformer_root, 'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
+            attn_mode=inference_attn,
         )
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
@@ -95,8 +106,7 @@ class VA_Server:
         self.streaming_vae_half = None
         if self.env_type == 'robotwin_tshape':
             vae_half = load_vae(
-                os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                             'vae'),
+                os.path.join(wan_aux_root, 'vae'),
                 torch_dtype=self.dtype,
                 torch_device='cpu' if self.enable_offload else self.device,
             )
@@ -221,15 +231,29 @@ class VA_Server:
         return latents
 
     def preprocess_action(self, action):
-        action_model_input = torch.from_numpy(action)
+        action_model_input = torch.from_numpy(action).float()
+        if action_model_input.ndim != 3:
+            raise ValueError(f"Expected action state shape [C,F,H], got {tuple(action_model_input.shape)}")
         CA, FA, HA = action_model_input.shape  # C, F, H
-        action_model_input_paded = F.pad(action_model_input,
-                                         [0, 0, 0, 0, 0, 1],
-                                         mode='constant',
-                                         value=0)
 
-        action_model_input = action_model_input_paded[
-            self.job_config.inverse_used_action_channel_ids]
+        used_dim = len(self.job_config.used_action_channel_ids)
+        action_dim = int(self.job_config.action_dim)
+
+        if CA == used_dim:
+            # Compact used-channel layout -> full 30D layout.
+            action_model_input_paded = F.pad(action_model_input,
+                                             [0, 0, 0, 0, 0, 1],
+                                             mode='constant',
+                                             value=0)
+            action_model_input = action_model_input_paded[
+                self.job_config.inverse_used_action_channel_ids]
+        elif CA == action_dim:
+            # Already full action layout.
+            pass
+        else:
+            raise ValueError(
+                f"Unsupported action channel dim {CA}, expected used_dim={used_dim} or action_dim={action_dim}."
+            )
 
         if self.action_norm_method == 'quantiles':
             action_model_input = (action_model_input - self.actions_q01) / (
@@ -321,12 +345,36 @@ class VA_Server:
                                                           action_mask] *= 0
         return input_dict
 
+    def _vae_cache_is_warm(self):
+        if any(each is not None for each in self.streaming_vae.feat_cache):
+            return True
+        if self.streaming_vae_half is not None and any(
+                each is not None for each in self.streaming_vae_half.feat_cache):
+            return True
+        return False
+
+    def _min_obs_frames_for_encode(self):
+        if not self._vae_cache_is_warm():
+            return 2
+
+        temporal_downsample = getattr(self.vae.config, 'temperal_downsample', None)
+        if temporal_downsample is None:
+            return 4
+
+        temporal_downsample_stages = int(sum(bool(v) for v in temporal_downsample))
+        return max(2, 2**temporal_downsample_stages)
+
     def _encode_obs(self, obs):
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
         if len(images) < 1:
             return None
+        min_obs_frames = self._min_obs_frames_for_encode()
+        if len(images) < min_obs_frames:
+            # Warm-cache encode needs enough frames for stacked temporal downsample.
+            pad_count = min_obs_frames - len(images)
+            images = [copy.deepcopy(images[0]) for _ in range(pad_count)] + images
         videos = []
         for k_i, k in enumerate(self.job_config.obs_cam_keys):
             if self.env_type == 'robotwin_tshape':
@@ -675,7 +723,7 @@ class VA_Server:
 
 def run(args):    
     
-    config = VA_CONFIGS[args.config_name]
+    config = get_config(args.config_name)
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root

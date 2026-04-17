@@ -50,35 +50,6 @@ from utils import (
 from .dataset import MultiLatentLeRobotDataset
 import gc
 
-import gc
-
-
-def _pad_tensor_along_dim(x: torch.Tensor, target_len: int, dim: int, pad_value=0):
-    """
-    沿指定维度补到 target_len。
-    x: torch.Tensor
-    dim: 要补的维度
-    """
-    cur_len = x.shape[dim]
-    if cur_len == target_len:
-        return x
-
-    if cur_len > target_len:
-        slices = [slice(None)] * x.ndim
-        slices[dim] = slice(0, target_len)
-        return x[tuple(slices)]
-
-    pad_shape = list(x.shape)
-    pad_shape[dim] = target_len - cur_len
-    pad_tensor = torch.full(
-        pad_shape,
-        fill_value=pad_value,
-        dtype=x.dtype,
-        device=x.device,
-    )
-    return torch.cat([x, pad_tensor], dim=dim)
-
-
 def _pad_tensor_along_dim(x: torch.Tensor, target_len: int, dim: int, pad_value=0):
     cur_len = x.shape[dim]
     if cur_len == target_len:
@@ -205,43 +176,45 @@ class Trainer:
         if config.enable_wandb and config.rank == 0:
             api_key = os.environ.get("WANDB_API_KEY")
             if not api_key:
-                raise RuntimeError(
-                    "enable_wandb=True but WANDB_API_KEY is not set. Export it or set enable_wandb=False."
+                logger.warning(
+                    "enable_wandb=True but WANDB_API_KEY is not set; disable wandb logging for this run."
                 )
-            base_url = os.environ.get("WANDB_BASE_URL", "https://api.wandb.ai")
-            wandb.login(host=base_url, key=api_key)
-            self.wandb = wandb
-            # 403 upsertBucket: entity 必须与 key 有写权限的 team/user 一致。
-            # 优先级: config.wandb_entity -> WANDB_ENTITY -> WANDB_TEAM_NAME；皆空则不传 entity，用 key 默认 workspace。
-            entity = (
-                getattr(config, "wandb_entity", None)
-                or os.environ.get("WANDB_ENTITY")
-                or os.environ.get("WANDB_TEAM_NAME")
-            )
-            project = (
-                getattr(config, "wandb_project", None)
-                or os.environ.get("WANDB_PROJECT", "va_robotwin")
-            )
-            run_name = (
-                getattr(config, "wandb_run_name", None)
-                or os.environ.get("WANDB_RUN_NAME", "train")
-            )
-            mode = os.environ.get("WANDB_MODE", "online")
-            init_kw = dict(
-                project=project,
-                config=config,
-                mode=mode,
-                name=run_name,
-            )
-            if entity:
-                init_kw["entity"] = entity
-            self.wandb.init(**init_kw)
-            logger.info(
-                "WandB enabled: project=%r, entity=%s, mode=%r",
-                project,
-                entity if entity else "<default from API key>",
-                mode,
-            )
+                config.enable_wandb = False
+            else:
+                base_url = os.environ.get("WANDB_BASE_URL", "https://api.wandb.ai")
+                wandb.login(host=base_url, key=api_key)
+                self.wandb = wandb
+                # 403 upsertBucket: entity 必须与 key 有写权限的 team/user 一致。
+                # 优先级: config.wandb_entity -> WANDB_ENTITY -> WANDB_TEAM_NAME；皆空则不传 entity，用 key 默认 workspace。
+                entity = (
+                    getattr(config, "wandb_entity", None)
+                    or os.environ.get("WANDB_ENTITY")
+                    or os.environ.get("WANDB_TEAM_NAME")
+                )
+                project = (
+                    getattr(config, "wandb_project", None)
+                    or os.environ.get("WANDB_PROJECT", "va_robotwin")
+                )
+                run_name = (
+                    getattr(config, "wandb_run_name", None)
+                    or os.environ.get("WANDB_RUN_NAME", "train")
+                )
+                mode = os.environ.get("WANDB_MODE", "online")
+                init_kw = dict(
+                    project=project,
+                    config=config,
+                    mode=mode,
+                    name=run_name,
+                )
+                if entity:
+                    init_kw["entity"] = entity
+                self.wandb.init(**init_kw)
+                logger.info(
+                    "WandB enabled: project=%r, entity=%s, mode=%r",
+                    project,
+                    entity if entity else "<default from API key>",
+                    mode,
+                )
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -449,8 +422,8 @@ class Trainer:
         self._amp_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
         self._use_fp16_scaler = self._use_amp and self.dtype == torch.float16
         self._grad_scaler = GradScaler("cuda", enabled=self._use_fp16_scaler)
-        # if hasattr(config, 'resume_from') and config.resume_from:
-        #     self._load_training_state(config.resume_from)
+        if hasattr(config, 'resume_from') and config.resume_from:
+            self._load_training_state(config.resume_from)
     def report_cuda_mem(self, tag=""):
         if not torch.cuda.is_available():
             return
@@ -558,7 +531,6 @@ class Trainer:
             grid_id=latent_grid_id,
         )
 
-    @torch.no_grad()
     @torch.no_grad()
     def _prepare_input_dict(self, batch_dict):
         latent_dict = self._add_noise(
@@ -907,6 +879,7 @@ class Trainer:
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
         try:
+            optim_state = None
             if self.use_deepspeed:
                 transformer_module = (
                     self.transformer.module
@@ -922,11 +895,12 @@ class Trainer:
                     self.transformer,
                     options=StateDictOptions(full_state_dict=True, cpu_offload=True),
                 )
+                optim_state = get_optimizer_state_dict(
+                    self.transformer,
+                    self.optimizer,
+                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+                )
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
 
             # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
@@ -951,14 +925,15 @@ class Trainer:
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
 
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
+                # Save optimizer state for resumable training (FSDP path).
+                if optim_state is not None:
+                    training_state_path = checkpoint_dir / "training_state.pt"
+                    logger.info(f"Saving training state to {training_state_path}")
+                    torch.save({
+                        'step': self.step,
+                        'optimizer_state_dict': optim_state,
+                        'config': vars(self.config),
+                    }, training_state_path)
 
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
 
@@ -977,6 +952,11 @@ class Trainer:
 
     def _load_training_state(self, checkpoint_path):
         """Load training state (optimizer + step) after FSDP and optimizer creation."""
+        if self.use_deepspeed:
+            if self.config.rank == 0:
+                logger.warning("DeepSpeed path currently skips optimizer state restore from training_state.pt.")
+            return
+
         checkpoint_dir = Path(checkpoint_path)
         training_state_path = checkpoint_dir / "training_state.pt"
 
@@ -1092,9 +1072,6 @@ class Trainer:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
-
-            if dist.is_initialized():
-                dist.barrier()
 
         progress_bar.close()
         if self._cuda_mem_log_fp is not None:

@@ -16,6 +16,12 @@ from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
+try:
+    from robosuite.utils.transform_utils import axisangle2quat as _rs_axisangle2quat
+    from robosuite.utils.transform_utils import quat2axisangle as _rs_quat2axisangle
+except Exception:
+    _rs_axisangle2quat = None
+    _rs_quat2axisangle = None
 
 
 def _env_truthy(name: str) -> bool:
@@ -111,17 +117,73 @@ def quat_xyzw_to_euler_xyz(quat_xyzw):
     return euler.astype(np.float32)
 
 
+def _axisangle2quat_compat(vec):
+    if _rs_axisangle2quat is not None:
+        return _rs_axisangle2quat(vec)
+    # scipy fallback: rotation vector <-> quaternion are mathematically equivalent.
+    return R.from_rotvec(np.asarray(vec, dtype=np.float64)).as_quat()
+
+
+def _quat2axisangle_compat(quat):
+    if _rs_quat2axisangle is not None:
+        return _rs_quat2axisangle(quat)
+    # scipy fallback: returns rotvec (axis-angle vector).
+    return R.from_quat(np.asarray(quat, dtype=np.float64)).as_rotvec()
+
+
+def axisangle_to_quat_xyzw(axisangle):
+    """
+    Axis-angle(rotvec) -> Quaternion(x,y,z,w)
+
+    输入 shape: (..., 3)
+    输出 shape: (..., 4)
+    """
+    axisangle = _to_float_array(axisangle)
+    if _is_torch(axisangle):
+        device = axisangle.device
+        dtype = axisangle.dtype
+        axisangle_np = axisangle.detach().cpu().numpy().reshape(-1, 3)
+        quat_np = np.stack([_axisangle2quat_compat(v) for v in axisangle_np], axis=0).astype(np.float32)
+        quat = torch.from_numpy(quat_np).to(device=device, dtype=dtype)
+        return quat.reshape(*axisangle.shape[:-1], 4)
+
+    axisangle_np = np.asarray(axisangle, dtype=np.float32).reshape(-1, 3)
+    quat_np = np.stack([_axisangle2quat_compat(v) for v in axisangle_np], axis=0).astype(np.float32)
+    return quat_np.reshape(*axisangle.shape[:-1], 4)
+
+
+def quat_xyzw_to_axisangle(quat_xyzw):
+    """
+    Quaternion(x,y,z,w) -> Axis-angle(rotvec)
+
+    输入 shape: (..., 4)
+    输出 shape: (..., 3)
+    """
+    quat_xyzw = _to_float_array(quat_xyzw)
+    if _is_torch(quat_xyzw):
+        device = quat_xyzw.device
+        dtype = quat_xyzw.dtype
+        quat_np = quat_xyzw.detach().cpu().numpy().reshape(-1, 4)
+        axisangle_np = np.stack([_quat2axisangle_compat(v) for v in quat_np], axis=0).astype(np.float32)
+        axisangle = torch.from_numpy(axisangle_np).to(device=device, dtype=dtype)
+        return axisangle.reshape(*quat_xyzw.shape[:-1], 3)
+
+    quat_np = np.asarray(quat_xyzw, dtype=np.float32).reshape(-1, 4)
+    axisangle_np = np.stack([_quat2axisangle_compat(v) for v in quat_np], axis=0).astype(np.float32)
+    return axisangle_np.reshape(*quat_xyzw.shape[:-1], 3)
+
+
 def robocasa_to_lingbot(action_12):
     """
     RoboCasa 12D -> LingBot-VA 30D
 
     RoboCasa(12):
       0:3   EEF XYZ
-      3:6   EEF 旋转 Euler(x,y,z)  (假定为 roll,pitch,yaw，单位弧度)
+      3:6   EEF 旋转 Axis-angle(rotvec)
       6     Gripper
       7:9   Base XY
-      9     Torso Z
-      10    Base Yaw
+      9     Base Yaw
+      10    Torso Z
       11    Gate（模式）
 
     LingBot(30): 右臂(0:15) + 左臂(15:30)，每臂 15:
@@ -140,7 +202,7 @@ def robocasa_to_lingbot(action_12):
 
     # --- 主臂（右臂 0~14） ---
     out[..., 0:3] = action_12[..., 0:3]
-    out[..., 3:7] = euler_xyz_to_quat_xyzw(action_12[..., 3:6])
+    out[..., 3:7] = axisangle_to_quat_xyzw(action_12[..., 3:6])
     out[..., 14] = action_12[..., 6]
 
     mask[..., 0:3] = True
@@ -149,8 +211,8 @@ def robocasa_to_lingbot(action_12):
 
     # --- 副臂（左臂 15~29），用空槽位塞底盘/躯干 ---
     out[..., 15:17] = action_12[..., 7:9]   # base XY
-    out[..., 17] = action_12[..., 9]        # torso Z
-    out[..., 22] = action_12[..., 10]       # base yaw -> 副臂 J1
+    out[..., 17] = action_12[..., 10]      # torso Z
+    out[..., 22] = action_12[..., 9]       # base yaw -> 副臂 J1
     out[..., 29] = action_12[..., 11]       # gate -> 副臂 gripper
 
     mask[..., 15:17] = True
@@ -165,8 +227,9 @@ def lingbot_to_robocasa(action_30):
     """
     LingBot-VA 30D -> RoboCasa 12D
 
-    额外要求：
-    - Gate（RoboCasa[11]）必须做 hard thresholding：>0 -> 1.0, <=0 -> -1.0
+        语义约定（与 RoboCasa wrapper 一致）：
+        - gripper_close / control_mode 采用 0.5 阈值二值化，再映射为 {-1, +1}
+            （wrapper 内部判断同样使用 <0.5 / >=0.5）。
     """
     action_30 = _to_float_array(action_30)
     last_dim = action_30.shape[-1]
@@ -177,21 +240,25 @@ def lingbot_to_robocasa(action_30):
     else:
         out = np.zeros((*action_30.shape[:-1], 12), dtype=np.float32)
 
-    # 主臂：EEF XYZ + Quat->Euler + Gripper
+    # 主臂：EEF XYZ + Quat->Axis-angle + Gripper
     out[..., 0:3] = action_30[..., 0:3]
-    out[..., 3:6] = quat_xyzw_to_euler_xyz(action_30[..., 3:7])
-    out[..., 6] = action_30[..., 14]
+    out[..., 3:6] = quat_xyzw_to_axisangle(action_30[..., 3:7])
+    gripper = action_30[..., 14]
+    if _is_torch(action_30):
+        out[..., 6] = torch.where(gripper > 0.5, torch.ones_like(gripper), -torch.ones_like(gripper))
+    else:
+        out[..., 6] = np.where(gripper > 0.5, 1.0, -1.0).astype(np.float32)
 
     # 底盘/躯干：从副臂被劫持的槽位取回
     out[..., 7:9] = action_30[..., 15:17]
-    out[..., 9] = action_30[..., 17]
-    out[..., 10] = action_30[..., 22]
+    out[..., 10] = action_30[..., 17]
+    out[..., 9] = action_30[..., 22]
 
     gate = action_30[..., 29]
     if _is_torch(action_30):
-        out[..., 11] = torch.where(gate > 0, torch.ones_like(gate), -torch.ones_like(gate))
+        out[..., 11] = torch.where(gate > 0.5, torch.ones_like(gate), -torch.ones_like(gate))
     else:
-        out[..., 11] = np.where(gate > 0, 1.0, -1.0).astype(np.float32)
+        out[..., 11] = np.where(gate > 0.5, 1.0, -1.0).astype(np.float32)
 
     return out
 
@@ -952,8 +1019,8 @@ if __name__ == '__main__':
     print("EEF xyz (robo -> ling):", robo[0, 0:3], "=>", ling[0, 0:3])
     print("Gripper (robo -> ling):", robo[0, 6], "=>", ling[0, 14])
     print("Base XY (robo -> ling):", robo[0, 7:9], "=>", ling[0, 15:17])
-    print("TorsoZ (robo -> ling):", robo[0, 9], "=>", ling[0, 17])
-    print("Yaw (robo -> ling):", robo[0, 10], "=>", ling[0, 22])
+    print("TorsoZ (robo -> ling):", robo[0, 10], "=>", ling[0, 17])
+    print("Yaw (robo -> ling):", robo[0, 9], "=>", ling[0, 22])
     print("Gate (robo -> ling):", robo[0, 11], "=>", ling[0, 29])
     print("Gate thresholded (ling -> robo):", ling[0, 29], "=>", robo_rec[0, 11], "(must be +/-1)")
     
