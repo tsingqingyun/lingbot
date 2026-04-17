@@ -12,7 +12,7 @@ va_robocasa_cfg.update(va_shared_cfg)
 va_robocasa_cfg.wan22_pretrained_model_name_or_path = (
     os.environ.get(
         "LINGBOT_ROBOCASA_MODEL_PATH",
-        "/cephfs/shared/xcx/lingbot-va/train_out_1/checkpoints/checkpoint_step_9000",
+        "/cephfs/shared/xcx/lingbot-va/train_out/checkpoint_step_300",
     )
 )
 # Full Wan tree: vae/, tokenizer/, text_encoder/.
@@ -47,8 +47,8 @@ va_robocasa_cfg.action_snr_shift = 1.0
 va_robocasa_cfg.sample_by_frames = True
 va_robocasa_cfg.sample_unit_frames = 8
 
-va_robocasa_cfg.used_action_channel_ids = list(range(0, 7)) + list(
-    range(28, 29)) + list(range(7, 14)) + list(range(29, 30))
+# Keep this list aligned with wan_va.dataset.lerobot_latent_dataset.robocasa_to_lingbot mask.
+va_robocasa_cfg.used_action_channel_ids = [0, 1, 2, 3, 4, 5, 6, 14, 15, 16, 17, 22, 29]
 inverse_used_action_channel_ids = [
     len(va_robocasa_cfg.used_action_channel_ids)
 ] * va_robocasa_cfg.action_dim

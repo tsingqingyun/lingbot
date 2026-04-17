@@ -6,13 +6,13 @@ import copy
 import json
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import imageio
 import numpy as np
 
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
-from wan_va.dataset.lerobot_latent_dataset import lingbot_to_robocasa
+from wan_va.dataset.lerobot_latent_dataset import lingbot_to_robocasa, robocasa_to_lingbot
 
 
 DEFAULT_OBS_KEY_CANDIDATES = {
@@ -37,7 +37,19 @@ DEFAULT_OBS_KEY_CANDIDATES = {
     ),
 }
 
-USED_ACTION_CHANNEL_IDS = list(range(0, 7)) + [28] + list(range(7, 14)) + [29]
+def _infer_used_action_channel_ids() -> List[int]:
+    # Keep inference-side unpacking strictly aligned with dataset mapping logic.
+    _, mask_30 = robocasa_to_lingbot(np.zeros((1, 12), dtype=np.float32))
+    if hasattr(mask_30, "detach"):
+        mask_30 = mask_30.detach().cpu().numpy()
+    mask_30 = np.asarray(mask_30, dtype=bool)
+    channel_ids = np.flatnonzero(mask_30[0]).astype(np.int64).tolist()
+    if len(channel_ids) == 0:
+        raise RuntimeError("Failed to infer used RoboCasa action channels from robocasa_to_lingbot.")
+    return channel_ids
+
+
+USED_ACTION_CHANNEL_IDS = _infer_used_action_channel_ids()
 
 
 def _find_obs_value(obs: Dict, candidates: Iterable[str]):
@@ -94,7 +106,7 @@ def used_channels_to_action30(action_used: np.ndarray) -> np.ndarray:
 
 def robocasa_action12_to_gym_dict(action_12: np.ndarray) -> Dict[str, np.ndarray]:
     """RoboCasa 12D flat action -> ``spaces.Dict`` keys for ``RoboCasaGymEnv.step``."""
-    a = np.asarray(action_12, dtype=np.float32).reshape(-1)
+    a, _ = sanitize_robocasa_action12(action_12)
     if a.shape[0] != 12:
         raise ValueError(f"Expected RoboCasa action dim 12, got shape {getattr(action_12, 'shape', None)}")
     # Same layout as ``wan_va.dataset.lerobot_latent_dataset.robocasa_to_lingbot``.
@@ -105,6 +117,50 @@ def robocasa_action12_to_gym_dict(action_12: np.ndarray) -> Dict[str, np.ndarray
         "action.base_motion": a[7:11].copy(),
         "action.control_mode": a[11:12].copy(),
     }
+
+
+def sanitize_robocasa_action12(action_12: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """Clamp to RoboCasa gym action bounds and drop NaN/Inf before env.step."""
+    raw = np.asarray(action_12, dtype=np.float32).reshape(-1)
+    if raw.shape[0] != 12:
+        raise ValueError(f"Expected RoboCasa action dim 12, got shape {getattr(action_12, 'shape', None)}")
+    finite = np.nan_to_num(raw, nan=0.0, posinf=1.0, neginf=-1.0)
+    clipped = np.clip(finite, -1.0, 1.0).astype(np.float32, copy=False)
+    changed = not np.allclose(raw, clipped, atol=1e-6, rtol=0.0, equal_nan=True)
+    return clipped, changed
+
+
+def summarize_episode_action_stats(executed_actions: List[np.ndarray], clipped_steps: int) -> Dict[str, Any]:
+    if len(executed_actions) == 0:
+        return {
+            "executed_action_steps": 0,
+            "clipped_action_steps": int(clipped_steps),
+            "clipped_action_ratio": 0.0,
+        }
+
+    arr = np.asarray(executed_actions, dtype=np.float32).reshape(-1, 12)
+    base = arr[:, 7:11]
+    mode = arr[:, 11]
+
+    base_absdiff = np.abs(np.diff(base, axis=0)) if arr.shape[0] > 1 else np.zeros((0, 4), dtype=np.float32)
+    mode_change_rate = float(np.mean(mode[1:] != mode[:-1])) if mode.shape[0] > 1 else 0.0
+
+    stats: Dict[str, Any] = {
+        "executed_action_steps": int(arr.shape[0]),
+        "clipped_action_steps": int(clipped_steps),
+        "clipped_action_ratio": float(clipped_steps / max(1, arr.shape[0])),
+        "mode_change_rate": mode_change_rate,
+        "mode_positive_ratio": float(np.mean(mode > 0.5)),
+        "base_mean": base.mean(axis=0).astype(np.float64).tolist(),
+        "base_std": base.std(axis=0).astype(np.float64).tolist(),
+    }
+    if base_absdiff.shape[0] > 0:
+        stats["base_absdiff_mean"] = base_absdiff.mean(axis=0).astype(np.float64).tolist()
+        stats["base_absdiff_p95"] = np.quantile(base_absdiff, 0.95, axis=0).astype(np.float64).tolist()
+    else:
+        stats["base_absdiff_mean"] = [0.0, 0.0, 0.0, 0.0]
+        stats["base_absdiff_p95"] = [0.0, 0.0, 0.0, 0.0]
+    return stats
 
 
 def infer_success(info: Dict, terminated: bool) -> bool:
@@ -159,36 +215,127 @@ def configure_robocasa_dataset_path(dataset_base_path: Optional[str]) -> Optiona
     return normalized
 
 
+def _prompt_from_value(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else None
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _prompt_from_value(value.item())
+        if value.size == 0:
+            return None
+        if value.dtype.kind in ("U", "S", "O"):
+            return _prompt_from_value(value.reshape(-1)[0])
+        return None
+    return None
+
+
+def _prompt_from_reset_obs(reset_obs: Dict) -> Optional[str]:
+    if not isinstance(reset_obs, dict):
+        return None
+    for key in (
+        "annotation.human.task_description",
+        "language",
+        "task",
+    ):
+        text = _prompt_from_value(reset_obs.get(key))
+        if text:
+            return text
+    return None
+
+
+def _prompt_from_env_meta(env) -> Optional[str]:
+    for candidate in (getattr(env, "unwrapped", None), env):
+        if candidate is None:
+            continue
+        getter = getattr(candidate, "get_ep_meta", None)
+        if not callable(getter):
+            continue
+        try:
+            ep_meta = getter()
+        except Exception:
+            continue
+        if isinstance(ep_meta, dict):
+            text = _prompt_from_value(ep_meta.get("lang"))
+            if text:
+                return text
+    return None
+
+
+def resolve_episode_prompt(explicit_prompt: str, env, reset_obs: Dict, env_id: str) -> Tuple[str, str]:
+    text = _prompt_from_value(explicit_prompt)
+    if text:
+        return text, "args.prompt"
+
+    text = _prompt_from_reset_obs(reset_obs)
+    if text:
+        return text, "reset_obs.annotation.human.task_description"
+
+    text = _prompt_from_env_meta(env)
+    if text:
+        return text, "env.get_ep_meta().lang"
+
+    text = _prompt_from_value(getattr(getattr(env, "unwrapped", env), "instruction", None))
+    if text:
+        return text, "env.unwrapped.instruction"
+
+    return env_id, "env_id_fallback"
+
+
 def run_episode(
     env,
     model: WebsocketClientPolicy,
-    prompt: str,
+    explicit_prompt: str,
+    env_id: str,
     max_steps: int,
     video_guidance_scale: float,
     action_guidance_scale: float,
-) -> Tuple[bool, int, List[np.ndarray]]:
+) -> Tuple[bool, int, List[np.ndarray], str, Dict[str, Any]]:
     reset_out = env.reset()
     if isinstance(reset_out, tuple):
         obs, reset_info = reset_out
     else:
         obs, reset_info = reset_out, {}
 
+    episode_prompt, prompt_source = resolve_episode_prompt(
+        explicit_prompt=explicit_prompt,
+        env=env,
+        reset_obs=obs,
+        env_id=env_id,
+    )
+    if prompt_source == "env_id_fallback":
+        print(
+            "[Warn] Could not find language prompt in args/reset_obs/ep_meta/instruction; "
+            f"fallback prompt uses env_id='{env_id}'."
+        )
+
     frame = format_obs_for_lingbot(obs)
     frames_for_video = [frame["observation.images.robot0_agentview_left"]]
 
-    model.infer(dict(reset=True, prompt=prompt))
+    model.infer(dict(reset=True, prompt=episode_prompt))
 
     done = False
     success = False
     step_count = 0
     first = True
+    executed_actions: List[np.ndarray] = []
+    clipped_action_steps = 0
 
     while (not done) and (step_count < max_steps):
         server_obs = frame if first else next_frame
+        infer_obs = server_obs
+        if first:
+            # The server-side streaming VAE can enter a cached temporal branch where
+            # kernel_size=3 effectively requires >=2 fresh frames in this request.
+            infer_obs = [copy.deepcopy(server_obs) for _ in range(2)]
         ret = model.infer(
             dict(
-                obs=server_obs,
-                prompt=prompt,
+                obs=infer_obs,
+                prompt=episode_prompt,
                 video_guidance_scale=video_guidance_scale,
                 action_guidance_scale=action_guidance_scale,
             )
@@ -212,7 +359,10 @@ def run_episode(
             stepped = False
             for j in range(action_12_seq.shape[1]):
                 stepped = True
-                action_12 = action_12_seq[i, j]
+                raw_action_12 = action_12_seq[i, j]
+                action_12, clipped = sanitize_robocasa_action12(raw_action_12)
+                clipped_action_steps += int(clipped)
+                executed_actions.append(action_12.copy())
                 step_out = env.step(robocasa_action12_to_gym_dict(action_12))
                 if len(step_out) == 5:
                     obs, _, terminated, truncated, info = step_out
@@ -237,7 +387,9 @@ def run_episode(
                 break
 
         if key_frame_list:
-            min_kv_cache_frames = pred.shape[1]
+            # Warm VAE caches can hit multiple temporal downsample stages.
+            # In practice this path needs >=4 frames for robust conv3d(k=3) validity.
+            min_kv_cache_frames = max(4, pred.shape[1])
             cache_frames = list(key_frame_list)
             if len(cache_frames) < min_kv_cache_frames:
                 padding_count = min_kv_cache_frames - len(cache_frames)
@@ -256,7 +408,8 @@ def run_episode(
             next_frame = frame
         first = False
 
-    return success, step_count, frames_for_video
+    action_stats = summarize_episode_action_stats(executed_actions, clipped_action_steps)
+    return success, step_count, frames_for_video, episode_prompt, action_stats
 
 
 def parse_args():
@@ -307,20 +460,11 @@ def main():
         env_seed = args.seed + ep
         env = create_env(args.env_id, split=args.split, seed=env_seed, render_mode=args.render_mode)
         try:
-            if args.prompt:
-                episode_prompt = args.prompt
-            else:
-                episode_prompt = getattr(env.unwrapped, "instruction", None)
-                if not episode_prompt:
-                    print(
-                        "[Warn] env.unwrapped.instruction is missing; "
-                        f"fallback prompt uses env_id='{args.env_id}'."
-                    )
-                    episode_prompt = args.env_id
-            ok, steps, frames = run_episode(
+            ok, steps, frames, episode_prompt, action_stats = run_episode(
                 env=env,
                 model=model,
-                prompt=episode_prompt,
+                explicit_prompt=args.prompt,
+                env_id=args.env_id,
                 max_steps=args.max_steps,
                 video_guidance_scale=args.video_guidance_scale,
                 action_guidance_scale=args.action_guidance_scale,
@@ -336,6 +480,7 @@ def main():
             "steps": int(steps),
             "env_id": args.env_id,
             "prompt": episode_prompt,
+            "action_stats": action_stats,
         }
         episode_metrics.append(record)
 
@@ -347,6 +492,8 @@ def main():
         print(
             f"[Episode {ep + 1}/{args.n_episodes}] "
             f"success={ok} steps={steps} "
+            f"mode_change_rate={action_stats.get('mode_change_rate', 0.0):.4f} "
+            f"clip_ratio={action_stats.get('clipped_action_ratio', 0.0):.4f} "
             f"running_sr={succ / (ep + 1):.4f}"
         )
 

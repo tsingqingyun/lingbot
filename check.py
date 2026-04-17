@@ -264,15 +264,25 @@ def _robocasa_lingbot_roundtrip_selftest() -> dict:
     robo[0, 11] = 0.2
     ling, ling_mask = robocasa_to_lingbot(robo)
     robo_rec = lingbot_to_robocasa(ling)
-    # gate 经阈值后仅符号保留
-    err_pose = float(np.abs(robo[0, :11] - robo_rec[0, :11]).max())
-    gate_ok = float(robo_rec[0, 11]) in (-1.0, 1.0)
+    # 连续维应近似可逆；离散维（gripper/gate）按阈值二值化后再校验。
+    continuous_ids = np.array([0, 1, 2, 3, 4, 5, 7, 8, 9, 10], dtype=np.int64)
+    err_cont = float(np.abs(robo[0, continuous_ids] - robo_rec[0, continuous_ids]).max())
+
+    expected_gripper = 1.0 if float(robo[0, 6]) > 0.5 else -1.0
+    expected_gate = 1.0 if float(robo[0, 11]) > 0.5 else -1.0
+    gripper_ok = float(robo_rec[0, 6]) == expected_gripper
+    gate_ok = float(robo_rec[0, 11]) == expected_gate
+
     mask_ct = int(np.asarray(ling_mask[0]).sum())
-    ok = err_pose < 1e-5 and gate_ok and mask_ct == 13
+    ok = err_cont < 1e-5 and gripper_ok and gate_ok and mask_ct == 13
     return {
         "ok": ok,
-        "max_abs_err_dims_0_10": err_pose,
+        "max_abs_err_continuous_dims": err_cont,
+        "gripper_recovered": float(robo_rec[0, 6]),
+        "gripper_expected": expected_gripper,
+        "gripper_thresholded_ok": gripper_ok,
         "gate_recovered": float(robo_rec[0, 11]),
+        "gate_expected": expected_gate,
         "gate_thresholded_ok": gate_ok,
         "lingbot_mask_true_count": mask_ct,
     }
