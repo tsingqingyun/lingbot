@@ -1,0 +1,17 @@
+{
+  "env_id": "robocasa/SearingMeat",
+  "split": "target",
+  "n_episodes": 1,
+  "success_num": 0,
+  "success_rate": 0.0,
+  "episodes": [
+    {
+      "episode_id": 0,
+      "seed": 0,
+      "success": false,
+      "steps": 500,
+      "env_id": "robocasa/SearingMeat",
+      "prompt": "Grab the pan from the cabinet and place it on the rear left burner on the stove. Then place the shrimp on the stove and turn the burner on."
+    }
+  ]
+}

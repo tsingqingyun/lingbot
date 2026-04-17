@@ -164,11 +164,13 @@ def quat_xyzw_to_axisangle(quat_xyzw):
         device = quat_xyzw.device
         dtype = quat_xyzw.dtype
         quat_np = quat_xyzw.detach().cpu().numpy().reshape(-1, 4)
+        quat_np = quat_np / np.clip(np.linalg.norm(quat_np, axis=1, keepdims=True), 1e-8, None)
         axisangle_np = np.stack([_quat2axisangle_compat(v) for v in quat_np], axis=0).astype(np.float32)
         axisangle = torch.from_numpy(axisangle_np).to(device=device, dtype=dtype)
         return axisangle.reshape(*quat_xyzw.shape[:-1], 3)
 
     quat_np = np.asarray(quat_xyzw, dtype=np.float32).reshape(-1, 4)
+    quat_np = quat_np / np.clip(np.linalg.norm(quat_np, axis=1, keepdims=True), 1e-8, None)
     axisangle_np = np.stack([_quat2axisangle_compat(v) for v in quat_np], axis=0).astype(np.float32)
     return axisangle_np.reshape(*quat_xyzw.shape[:-1], 3)
 

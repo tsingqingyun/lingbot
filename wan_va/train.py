@@ -2,6 +2,7 @@
 import argparse
 import csv
 import os
+import subprocess
 import sys
 import time
 from functools import partial
@@ -49,6 +50,59 @@ from utils import (
 
 from .dataset import MultiLatentLeRobotDataset
 import gc
+
+
+def _git_metadata(repo_root: Path) -> dict:
+    def _run_git(*args: str) -> str | None:
+        try:
+            out = subprocess.run(
+                ["git", *args],
+                cwd=repo_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except Exception:
+            return None
+        text = out.stdout.strip()
+        return text or None
+
+    return {
+        "git_commit": _run_git("rev-parse", "HEAD"),
+        "git_branch": _run_git("rev-parse", "--abbrev-ref", "HEAD"),
+        "git_status_short": _run_git("status", "--short"),
+    }
+
+
+def _jsonable_config_subset(config) -> dict:
+    keys = [
+        "config_name",
+        "dataset_path",
+        "task_names",
+        "empty_emb_path",
+        "save_root",
+        "resume_from",
+        "wan22_pretrained_model_name_or_path",
+        "wan22_base_pretrained_model_name_or_path",
+        "env_type",
+        "frame_chunk_size",
+        "action_per_frame",
+        "action_dim",
+        "used_action_channel_ids",
+        "action_norm_method",
+        "num_steps",
+        "batch_size",
+        "gradient_accumulation_steps",
+        "learning_rate",
+    ]
+    out = {}
+    for key in keys:
+        value = getattr(config, key, None)
+        if isinstance(value, Path):
+            value = str(value)
+        out[key] = value
+    return out
 
 def _pad_tensor_along_dim(x: torch.Tensor, target_len: int, dim: int, pad_value=0):
     cur_len = x.shape[dim]
@@ -549,9 +603,18 @@ class Trainer:
             noisy_cond_prob=0.0,
         )
 
+        # Match inference contract: the action branch does not get a separate
+        # clean-action stream. The first action frame acts as an empty prefix
+        # rather than a denoising target.
+        action_dict['noisy_latents'][:, :, 0:1] = 0
+        action_dict['latent'][:, :, 0:1] = 0
+        action_dict['targets'][:, :, 0:1] = 0
+        action_dict['timesteps'][:, 0:1] = 0
+
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
-        action_dict['actions_mask'] = batch_dict['actions_mask']
+        action_dict['actions_mask'] = batch_dict['actions_mask'].clone()
+        action_dict['actions_mask'][:, :, 0:1] = 0
 
         if 'latents_mask' in batch_dict:
             latent_dict['latents_mask'] = batch_dict['latents_mask']
@@ -925,6 +988,17 @@ class Trainer:
                 with open(config_file, 'w') as f:
                     json.dump(config_dict, f, indent=2)
 
+                provenance_path = checkpoint_dir / "provenance.json"
+                provenance = {
+                    "step": self.step,
+                    "saved_at_unix": time.time(),
+                    "hostname": os.uname().nodename,
+                    "config": _jsonable_config_subset(self.config),
+                    **_git_metadata(Path(__file__).resolve().parent.parent),
+                }
+                with open(provenance_path, "w", encoding="utf-8") as f:
+                    json.dump(provenance, f, ensure_ascii=False, indent=2)
+
                 # Save optimizer state for resumable training (FSDP path).
                 if optim_state is not None:
                     training_state_path = checkpoint_dir / "training_state.pt"
@@ -1084,6 +1158,7 @@ class Trainer:
 def run(args):
     """Main entry point."""
     config = get_config(args.config_name)
+    config.config_name = args.config_name
     config.use_deepspeed = bool(args.use_deepspeed)
     if args.deepspeed_config is not None:
         config.deepspeed_config = args.deepspeed_config

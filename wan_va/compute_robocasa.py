@@ -4,14 +4,13 @@
 import os
 import sys
 import json
-import bisect
 import numpy as np
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configs import get_config
-from .dataset import MultiLatentLeRobotDataset
+from dataset import MultiLatentLeRobotDataset
 
 
 def main():
@@ -28,21 +27,26 @@ def main():
 
     values_per_channel = [[] for _ in range(30)]
 
-    for global_idx in tqdm(range(len(dset)), desc="compute 30d stats"):
-        dset_id = bisect.bisect_right(dset._acc_prefix, global_idx) - 1
-        local_idx = global_idx - dset._acc_prefix[dset_id]
+    # MultiLatentLeRobotDataset 已改为按帧加权的虚拟样本长度（_sample_prefix），
+    # 不再有 _acc_prefix。统计 norm 应对每个 repo 的每个 clip 各扫一次（与训练样本一一对应），
+    # 不要按 len(dset) 虚拟索引重复统计同一条 meta。
+    total_clips = sum(len(sub) for sub in dset._datasets)
+    pbar = tqdm(total=total_clips, desc="compute 30d stats")
+    for sub_dset in dset._datasets:
+        for local_idx in range(len(sub_dset)):
+            item = sub_dset.get_stats_item(local_idx)
+            pbar.update(1)
 
-        sub_dset = dset._datasets[dset_id]
-        item = sub_dset.get_stats_item(local_idx)
+            action_30 = item["action_30"]  # [N, 30]
+            mask_30 = item["action_mask_30"]  # [N, 30]
 
-        action_30 = item["action_30"]          # [N, 30]
-        mask_30 = item["action_mask_30"]       # [N, 30]
+            for c in range(30):
+                valid = mask_30[:, c].astype(bool)
+                vals = action_30[valid, c]
+                if vals.size > 0:
+                    values_per_channel[c].append(vals.astype(np.float64))
 
-        for c in range(30):
-            valid = mask_30[:, c].astype(bool)
-            vals = action_30[valid, c]
-            if vals.size > 0:
-                values_per_channel[c].append(vals.astype(np.float64))
+    pbar.close()
 
     mean = []
     std = []

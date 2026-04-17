@@ -6,6 +6,10 @@ from .logging import logger
 from .Simple_Remote_Infer.deploy.websocket_policy_server import WebsocketPolicyServer
 
 
+def _dist_ready() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
 class DistributedModelWrapper:
     """
     TODO
@@ -23,8 +27,17 @@ def distributed_infer(model, obs, local_rank):
     """
     TODO
     """
+    # Single-process server path: no process group initialized.
+    if not _dist_ready():
+        return model.infer(obs)
+
     rank = dist.get_rank()
+    world_size = dist.get_world_size()
     assert rank == local_rank, "distributed_infer can only run at（rank 0)"
+
+    # One-process distributed path does not need command broadcasting.
+    if world_size <= 1:
+        return model.infer(obs)
 
     cmd = torch.tensor(1,
                        dtype=torch.int64,
@@ -43,6 +56,10 @@ def worker_loop(model, local_rank):
     """
     TODO
     """
+    if not _dist_ready():
+        logger.info("[worker_loop] distributed process group is not initialized, skipping worker loop.")
+        return
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     rank = dist.get_rank()
 
@@ -71,11 +88,13 @@ def run_async_server_mode(model, local_rank, host, port):
         model_server = WebsocketPolicyServer(dist_model, host=host, port=port)
         model_server.serve_forever()
 
-        cmd = torch.tensor(
-            -1,
-            dtype=torch.int64,
-            device='cuda' if torch.cuda.is_available() else 'cpu')
-        dist.broadcast(cmd, src=0)
+        # Notify workers only when running with multi-process distributed inference.
+        if _dist_ready() and dist.get_world_size() > 1:
+            cmd = torch.tensor(
+                -1,
+                dtype=torch.int64,
+                device='cuda' if torch.cuda.is_available() else 'cpu')
+            dist.broadcast(cmd, src=0)
     else:
         try:
             worker_loop(model, local_rank)

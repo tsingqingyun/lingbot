@@ -452,6 +452,7 @@ class FlexAttnFunc(nn.Module):
         patch_size,
         text_len,
         device,
+        include_action_condition=True,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
@@ -461,24 +462,26 @@ class FlexAttnFunc(nn.Module):
             -1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]
         ).flatten()
         action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
-        seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
+        action_stream_repeat = 2 if include_action_condition else 1
+        seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * action_stream_repeat)
 
         latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(
             B, -1, L_H // patch_size[1], L_W // patch_size[2]
         )[None].flatten()
         action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
         frame_ids = torch.cat(
-            [latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2
+            [latent_frame_id // chunk_size * 2] * 2
+            + [action_frame_id // chunk_size * 2 + 1] * action_stream_repeat
         )
 
-        noise_ids = torch.cat(
-            [
-                torch.zeros_like(latent_frame_id),
-                torch.ones_like(latent_frame_id),
-                torch.zeros_like(action_frame_id),
-                torch.ones_like(action_frame_id),
-            ]
-        )
+        noise_streams = [
+            torch.zeros_like(latent_frame_id),
+            torch.ones_like(latent_frame_id),
+            torch.zeros_like(action_frame_id),
+        ]
+        if include_action_condition:
+            noise_streams.append(torch.ones_like(action_frame_id))
+        noise_ids = torch.cat(noise_streams)
 
         seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
@@ -1169,8 +1172,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
         input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
-        input_dict['action_dict']['latent'] = input_dict['action_dict']['latent'].to(torch.bfloat16)
-
         latent_dict = input_dict['latent_dict']
         action_dict = input_dict['action_dict']
         batch_size = latent_dict['noisy_latents'].shape[0]
@@ -1183,30 +1184,25 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         text_hidden_states = text_hidden_states.flatten(0, 1)[None]
 
         condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
-        condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
-
         hidden_states = torch.cat(
             [
                 latent_hidden_states,
                 condition_latent_hidden_states,
                 action_hidden_states,
-                condition_action_hidden_states,
             ],
             dim=1,
         )
 
         latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
         action_grid_id = action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
-        full_grid_id = torch.cat([latent_grid_id] * 2 + [action_grid_id] * 2, dim=2)
+        full_grid_id = torch.cat([latent_grid_id] * 2 + [action_grid_id], dim=2)
 
         rotary_emb = self.rope(full_grid_id)[:, :, None]
 
         latent_time_steps = torch.cat(
             [latent_dict['timesteps'].flatten(0, 1), latent_dict['cond_timesteps'].flatten(0, 1)]
         )[None]
-        action_time_steps = torch.cat(
-            [action_dict['timesteps'].flatten(0, 1), action_dict['cond_timesteps'].flatten(0, 1)]
-        )[None]
+        action_time_steps = action_dict['timesteps'].flatten(0, 1)[None]
 
         latent_temb, latent_timestep_proj = self._time_embed(
             latent_time_steps,
@@ -1236,7 +1232,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_hidden_states.shape[1],
             condition_latent_hidden_states.shape[1],
             action_hidden_states.shape[1],
-            condition_action_hidden_states.shape[1],
             padded_length,
         ]
 
@@ -1249,6 +1244,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             patch_size=self.patch_size,
             text_len=text_hidden_states.shape[1],
             device=hidden_states.device,
+            include_action_condition=False,
         )
 
         # ===== debug switch: whether to enable cross-attention mask =====
@@ -1292,7 +1288,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         scale = scale.to(hidden_states.device).squeeze(1)
         hidden_states = (self.norm_out(hidden_states.float()) * (1. + scale) + shift).type_as(hidden_states)
 
-        latent_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
+        latent_hidden_states, _, action_hidden_states, _ = torch.split(hidden_states, split_list, dim=1)
 
         latent_hidden_states = self.proj_out(latent_hidden_states)
         latent_hidden_states = rearrange(

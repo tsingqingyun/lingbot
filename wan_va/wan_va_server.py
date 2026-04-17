@@ -260,12 +260,20 @@ class VA_Server:
                 self.actions_q99 - self.actions_q01 + 1e-6) * 2. - 1.
         else:
             raise NotImplementedError
+        # Match training-time RoboCasa action preprocessing: inactive 30D channels
+        # are masked to zero after normalization rather than left at their
+        # normalized "raw zero" values (typically -1 under quantile stats).
+        action_model_input = action_model_input * self.action_mask[:, None, None].to(action_model_input)
         return action_model_input.unsqueeze(0).unsqueeze(-1)  # B, C, F, H, W
 
     def postprocess_action(self, action):
         action = action.cpu()  # B, C, F, H, W
 
         action = action[0, ..., 0]  #C, F, H
+        # Training targets live in normalized action space and are masked /
+        # supervised around [-1, 1]. Clamping here prevents extreme sampling
+        # excursions from exploding after quantile denormalization.
+        action = torch.clamp(action, -1.0, 1.0)
         if self.action_norm_method == 'quantiles':
             action = (action + 1) / 2 * (self.actions_q99 - self.actions_q01 +
                                          1e-6) + self.actions_q01
@@ -308,7 +316,7 @@ class VA_Server:
                 get_mesh_id(latent_model_input.shape[-3] // patch_size[0],
                             latent_model_input.shape[-2] // patch_size[1],
                             latent_model_input.shape[-1] // patch_size[2], 0,
-                            1, frame_st_id).to(self.device),
+                            1, 0).to(self.device),
                 'text_emb':
                 self.prompt_embeds.to(self.dtype).clone(),
             }
@@ -331,7 +339,7 @@ class VA_Server:
                             action_model_input.shape[-1],
                             1,
                             1,
-                            frame_st_id,
+                            0,
                             action=True).to(self.device),
                 'text_emb':
                 self.prompt_embeds.to(self.dtype).clone(),
