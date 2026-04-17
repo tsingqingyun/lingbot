@@ -7,6 +7,9 @@ va_shared_cfg = EasyDict()
 va_shared_cfg.host = '0.0.0.0'
 va_shared_cfg.port = 29536
 
+# wan_va_server.run(): "server" (RPC/HTTP service) or "i2va" (single-process demo).
+va_shared_cfg.infer_mode = 'server'
+
 va_shared_cfg.param_dtype = torch.bfloat16
 va_shared_cfg.save_root = './train_out_new'
 

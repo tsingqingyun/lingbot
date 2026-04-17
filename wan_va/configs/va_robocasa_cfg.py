@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import os
+
 from easydict import EasyDict
 
 from .shared_config import va_shared_cfg
@@ -6,10 +8,22 @@ from .shared_config import va_shared_cfg
 va_robocasa_cfg = EasyDict(__name__='Config: VA robocasa')
 va_robocasa_cfg.update(va_shared_cfg)
 
-va_robocasa_cfg.wan22_pretrained_model_name_or_path = "/root/lingbot-va-base"
+# Trained checkpoint root (must contain subdirectory transformer/).
+va_robocasa_cfg.wan22_pretrained_model_name_or_path = (
+    os.environ.get(
+        "LINGBOT_ROBOCASA_MODEL_PATH",
+        "/cephfs/shared/xcx/lingbot-va/train_out_1/checkpoints/checkpoint_step_9000",
+    )
+)
+# Full Wan tree: vae/, tokenizer/, text_encoder/.
+va_robocasa_cfg.wan22_base_pretrained_model_name_or_path = os.environ.get(
+    "LINGBOT_WAN_BASE_PATH", "/cephfs/shared/xcxhx/lingbot-va"
+)
     
 va_robocasa_cfg.attn_window = 72
 va_robocasa_cfg.frame_chunk_size = 2
+# Websocket inference: use "torch" unless inference forward wires FlexAttn init_mask.
+va_robocasa_cfg.inference_attn_mode = "torch"
 va_robocasa_cfg.env_type = 'robocasa_tshape'
 
 va_robocasa_cfg.height = 256

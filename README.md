@@ -191,6 +191,46 @@ NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
 
 > **GPU Memory Requirements**: Approximately **18GB VRAM** for single-GPU i2av inference with offload mode enabled (VAE and text_encoder offloaded to CPU).
 
+### Evaluation on RoboCasa v1.0
+
+RoboCasa evaluation reuses the same LingBot-VA websocket inference server, but uses a dedicated RoboCasa client:
+
+```bash
+# optional: override model checkpoints used by --config-name robocasa
+export LINGBOT_ROBOCASA_MODEL_PATH=/path/to/checkpoint_step_xxx
+export LINGBOT_WAN_BASE_PATH=/path/to/wan22_root
+
+# server (single GPU)
+START_PORT=29056 MASTER_PORT=29061 \
+python -m torch.distributed.run --nproc_per_node 1 --master_port ${MASTER_PORT} \
+  wan_va/wan_va_server.py --config-name robocasa --port ${START_PORT} --save_root visualization/
+
+# client (recommended: point to your RoboCasa datasets base path)
+bash evaluation/robocasa/launch_client_robocasa.sh \
+  ./results_robocasa \
+  "robocasa/PickPlaceCounterToCabinet" \
+  1 \
+  /cephfs/shared/xcxhx/robocasa_datasets_composite
+```
+
+`--config-name robocasa` loads the built-in config at `wan_va/configs/va_robocasa_cfg.py`.
+
+You can also run the client directly for custom options:
+
+```bash
+python -m evaluation.robocasa.eval_policy_client_openpi \
+  --env_id "robocasa/PickPlaceCounterToCabinet" \
+  --split pretrain \
+  --n_episodes 1 \
+  --max_steps 500 \
+  --port 29056 \
+  --dataset_base_path /cephfs/shared/xcxhx/robocasa_datasets_composite \
+  --save_root ./results_robocasa
+```
+
+The client maps LingBot predicted channels back to RoboCasa 12D control actions using the built-in `lingbot_to_robocasa` mapping, and writes unified metrics to:
+`<save_root>/metrics/res.json`.
+
 
 ## Post-Training LingBot-VA
 
