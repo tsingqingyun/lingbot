@@ -6,7 +6,14 @@ import os
 va_robocasa_train_cfg = EasyDict(__name__='Config: VA robocasa train')
 va_robocasa_train_cfg.update(va_robocasa_cfg)
 
-# va_robotwin_train_cfg.resume_from = '/robby/share/Robotics/lilin1/code/Wan_VA_Release/train_out/checkpoints/checkpoint_step_10'
+# Resume training from a previous checkpoint directory.
+# Example:
+#   export LINGBOT_ROBOCASA_RESUME_FROM=/path/to/checkpoints/checkpoint_step_1000
+# Directory should contain `transformer/`; `training_state.pt` is optional.
+va_robocasa_train_cfg.resume_from = os.environ.get(
+    "LINGBOT_ROBOCASA_RESUME_FROM",
+    getattr(va_robocasa_cfg, "resume_from", None),
+)
 
 va_robocasa_train_cfg.dataset_path = os.environ.get(
     "LINGBOT_ROBOCASA_DATASET_PATH",
@@ -42,6 +49,14 @@ va_robocasa_train_cfg.batch_size = 1
 va_robocasa_train_cfg.gradient_accumulation_steps = 8
 # 训练时 window_size 原逻辑为 randint(4,65)→最大 64，偶发极大序列会顶满显存；此处限制上界（含）。
 va_robocasa_train_cfg.train_window_size_max = 40
+# Binary auxiliary supervision for discrete action channels:
+# 14 = gripper, 29 = control_mode (in LingBot 30D space).
+va_robocasa_train_cfg.enable_binary_action_aux = True
+va_robocasa_train_cfg.binary_action_aux_channels = [14, 29]
+va_robocasa_train_cfg.binary_action_aux_weight = 0.25
+va_robocasa_train_cfg.binary_action_aux_loss_type = "focal"  # "bce" | "focal"
+va_robocasa_train_cfg.binary_action_aux_focal_gamma = 2.0
+va_robocasa_train_cfg.binary_action_aux_pos_weight = 1.5
 # 0 = 每层对 attn1/ffn 额外做 AC（更省显存、更慢）；10 = 仅后 20 层（默认与其它任务一致）
 va_robocasa_train_cfg.ac_inner_checkpoint_min_layer = 0
 va_robocasa_train_cfg.num_steps = 50000

@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, random_split
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -236,39 +236,54 @@ class Trainer:
                 config.enable_wandb = False
             else:
                 base_url = os.environ.get("WANDB_BASE_URL", "https://api.wandb.ai")
-                wandb.login(host=base_url, key=api_key)
-                self.wandb = wandb
-                # 403 upsertBucket: entity 必须与 key 有写权限的 team/user 一致。
-                # 优先级: config.wandb_entity -> WANDB_ENTITY -> WANDB_TEAM_NAME；皆空则不传 entity，用 key 默认 workspace。
-                entity = (
-                    getattr(config, "wandb_entity", None)
-                    or os.environ.get("WANDB_ENTITY")
-                    or os.environ.get("WANDB_TEAM_NAME")
+                init_timeout = float(
+                    os.environ.get(
+                        "WANDB_INIT_TIMEOUT",
+                        getattr(config, "wandb_init_timeout", 180),
+                    )
                 )
-                project = (
-                    getattr(config, "wandb_project", None)
-                    or os.environ.get("WANDB_PROJECT", "va_robotwin")
-                )
-                run_name = (
-                    getattr(config, "wandb_run_name", None)
-                    or os.environ.get("WANDB_RUN_NAME", "train")
-                )
-                mode = os.environ.get("WANDB_MODE", "online")
-                init_kw = dict(
-                    project=project,
-                    config=config,
-                    mode=mode,
-                    name=run_name,
-                )
-                if entity:
-                    init_kw["entity"] = entity
-                self.wandb.init(**init_kw)
-                logger.info(
-                    "WandB enabled: project=%r, entity=%s, mode=%r",
-                    project,
-                    entity if entity else "<default from API key>",
-                    mode,
-                )
+                try:
+                    wandb.login(host=base_url, key=api_key)
+                    self.wandb = wandb
+                    # 403 upsertBucket: entity 必须与 key 有写权限的 team/user 一致。
+                    # 优先级: config.wandb_entity -> WANDB_ENTITY -> WANDB_TEAM_NAME；皆空则不传 entity，用 key 默认 workspace。
+                    entity = (
+                        getattr(config, "wandb_entity", None)
+                        or os.environ.get("WANDB_ENTITY")
+                        or os.environ.get("WANDB_TEAM_NAME")
+                    )
+                    project = (
+                        getattr(config, "wandb_project", None)
+                        or os.environ.get("WANDB_PROJECT", "va_robotwin")
+                    )
+                    run_name = (
+                        getattr(config, "wandb_run_name", None)
+                        or os.environ.get("WANDB_RUN_NAME", "train")
+                    )
+                    mode = os.environ.get("WANDB_MODE", "online")
+                    init_kw = dict(
+                        project=project,
+                        config=config,
+                        mode=mode,
+                        name=run_name,
+                        settings=wandb.Settings(init_timeout=init_timeout),
+                    )
+                    if entity:
+                        init_kw["entity"] = entity
+                    self.wandb.init(**init_kw)
+                    logger.info(
+                        "WandB enabled: project=%r, entity=%s, mode=%r, init_timeout=%.1fs",
+                        project,
+                        entity if entity else "<default from API key>",
+                        mode,
+                        init_timeout,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "WandB init failed (%r). Disable wandb logging for this run.",
+                        e,
+                    )
+                    config.enable_wandb = False
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -278,6 +293,25 @@ class Trainer:
         self.gradient_accumulation_steps = int(
             getattr(config, "gradient_accumulation_steps", 1)
         )
+        self.enable_binary_action_aux = bool(
+            getattr(config, "enable_binary_action_aux", False)
+        )
+        self.binary_action_aux_channels = [
+            int(x) for x in getattr(config, "binary_action_aux_channels", [14, 29])
+        ]
+        self.binary_action_aux_weight = float(
+            getattr(config, "binary_action_aux_weight", 0.0)
+        )
+        self.binary_action_aux_pos_weight = float(
+            getattr(config, "binary_action_aux_pos_weight", 1.0)
+        )
+        self.binary_action_aux_focal_gamma = float(
+            getattr(config, "binary_action_aux_focal_gamma", 2.0)
+        )
+        self.binary_action_aux_loss_type = str(
+            getattr(config, "binary_action_aux_loss_type", "bce")
+        ).lower()
+        self._last_binary_action_aux_loss = torch.tensor(0.0, device=self.device)
 
         # Load models
         logger.info("Loading models...")
@@ -413,7 +447,56 @@ class Trainer:
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(config=config)
+        train_dataset_full = MultiLatentLeRobotDataset(config=config)
+
+        self.validation_split_ratio = float(getattr(config, "validation_split_ratio", 0.01))
+        self.validation_interval = int(
+            getattr(config, "validation_interval", getattr(config, "save_interval", 0))
+        )
+        self.validation_num_batches = max(
+            1, int(getattr(config, "validation_num_batches", 8))
+        )
+        self.validation_split_seed = int(getattr(config, "validation_split_seed", 42))
+        self.val_loader = None
+
+        train_dataset = train_dataset_full
+        val_dataset = None
+        if (
+            self.validation_interval > 0
+            and self.validation_split_ratio > 0.0
+            and len(train_dataset_full) > 1
+        ):
+            total_size = len(train_dataset_full)
+            val_size = max(1, int(total_size * self.validation_split_ratio))
+            train_size = total_size - val_size
+            if train_size > 0:
+                split_generator = torch.Generator().manual_seed(self.validation_split_seed)
+                train_dataset, val_dataset = random_split(
+                    train_dataset_full,
+                    [train_size, val_size],
+                    generator=split_generator,
+                )
+            else:
+                if self.config.rank == 0:
+                    logger.warning(
+                        "Validation split disabled: train set would be empty (dataset size=%d, ratio=%.4f)",
+                        total_size,
+                        self.validation_split_ratio,
+                    )
+
+        if self.config.rank == 0:
+            if val_dataset is not None:
+                logger.info(
+                    "Validation enabled: split_ratio=%.4f, train_size=%d, val_size=%d, interval=%d, max_batches=%d",
+                    self.validation_split_ratio,
+                    len(train_dataset),
+                    len(val_dataset),
+                    self.validation_interval,
+                    self.validation_num_batches,
+                )
+            else:
+                logger.info("Validation disabled (no validation split).")
+
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=config.world_size,
@@ -424,11 +507,28 @@ class Trainer:
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
-            shuffle=(train_sampler is None), 
+            shuffle=(train_sampler is None),
             num_workers=config.load_worker,
             sampler=train_sampler,
             collate_fn=_collate_pad_batch,
         )
+
+        if val_dataset is not None:
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=config.world_size,
+                rank=config.rank,
+                shuffle=False,
+                seed=self.validation_split_seed,
+            ) if config.world_size > 1 else None
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.load_worker,
+                sampler=val_sampler,
+                collate_fn=_collate_pad_batch,
+            )
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(1000, training=True)
@@ -681,9 +781,139 @@ class Trainer:
             input_dict[key] = value.to(self.device)#.to(self.dtype)
         return input_dict
 
+    def _compute_action_reconstruction(self, action_pred, action_dict):
+        action_timesteps = action_dict['timesteps']
+        timestep_grid = self.train_scheduler_action.timesteps.to(
+            device=action_timesteps.device,
+            dtype=action_timesteps.dtype,
+        )
+        timestep_ids = torch.argmin(
+            (timestep_grid[:, None, None] - action_timesteps[None]).abs(),
+            dim=0,
+        )
+        sigma_grid = self.train_scheduler_action.sigmas.to(
+            device=action_timesteps.device,
+            dtype=action_pred.dtype,
+        )
+        sigma = sigma_grid[timestep_ids]
+
+        action_recon = action_dict['noisy_latents'].float() - (
+            sigma[:, None, :, None, None] * action_pred.float()
+        )
+        return action_recon
+
+    def _compute_binary_action_aux_loss(self, action_pred, action_dict):
+        if (not self.enable_binary_action_aux) or self.binary_action_aux_weight <= 0:
+            return action_pred.new_tensor(0.0)
+
+        action_recon = self._compute_action_reconstruction(action_pred, action_dict)
+        action_target = action_dict['latent'].float().detach()
+        action_mask = action_dict['actions_mask'].float()
+
+        valid_channels = []
+        for channel_id in self.binary_action_aux_channels:
+            if 0 <= channel_id < action_recon.shape[1]:
+                valid_channels.append(channel_id)
+        if len(valid_channels) == 0:
+            return action_pred.new_tensor(0.0)
+
+        recon_sel = action_recon[:, valid_channels]
+        target_sel = action_target[:, valid_channels]
+        mask_sel = action_mask[:, valid_channels]
+        target_bin = (target_sel > 0.0).float()
+
+        prob = torch.clamp((recon_sel + 1.0) * 0.5, 1e-5, 1.0 - 1e-5)
+        pos_w = max(self.binary_action_aux_pos_weight, 1e-6)
+        bce = -(
+            pos_w * target_bin * torch.log(prob)
+            + (1.0 - target_bin) * torch.log(1.0 - prob)
+        )
+        if self.binary_action_aux_loss_type == "focal":
+            pt = torch.where(target_bin > 0.5, prob, 1.0 - prob)
+            bce = bce * torch.pow(
+                torch.clamp(1.0 - pt, min=0.0),
+                self.binary_action_aux_focal_gamma,
+            )
+
+        bce = bce * mask_sel
+        denom = mask_sel.sum()
+        if denom <= 0:
+            return action_pred.new_tensor(0.0)
+        return bce.sum() / (denom + 1e-6)
+
+    def _compute_action_generation_mse(self, action_pred, action_dict):
+        action_recon = self._compute_action_reconstruction(action_pred, action_dict)
+        action_target = action_dict['latent'].float().detach()
+        action_mask = action_dict['actions_mask'].float()
+
+        action_generation_mse = (action_recon - action_target).pow(2)
+        action_generation_mse = action_generation_mse * action_mask
+
+        action_generation_mse = action_generation_mse.permute(0, 2, 3, 4, 1)
+        action_mask = action_mask.permute(0, 2, 3, 4, 1)
+        action_generation_mse = action_generation_mse.flatten(0, 1).flatten(1)
+        action_mask = action_mask.flatten(0, 1).flatten(1)
+
+        action_generation_mse_per_frame = action_generation_mse.sum(dim=1)
+        action_mask_per_frame = action_mask.sum(dim=1)
+        return (action_generation_mse_per_frame / (action_mask_per_frame + 1e-6)).mean()
+
+    @torch.no_grad()
+    def validate(self):
+        if self.val_loader is None:
+            return None
+
+        was_training = self.transformer.training
+        self.transformer.eval()
+
+        latent_losses = []
+        action_losses = []
+        action_generation_mses = []
+
+        for batch_idx, batch in enumerate(self.val_loader):
+            if batch_idx >= self.validation_num_batches:
+                break
+            batch = self.convert_input_format(batch)
+            input_dict = self._prepare_input_dict(batch)
+
+            with autocast(
+                device_type="cuda",
+                dtype=self._amp_dtype,
+                enabled=self._use_amp,
+            ):
+                output = self.transformer(input_dict, train_mode=True)
+                latent_loss, action_loss, action_generation_mse = self.compute_loss(
+                    input_dict,
+                    output,
+                    scale_by_grad_accum=False,
+                )
+
+            latent_losses.append(latent_loss.detach())
+            action_losses.append(action_loss.detach())
+            action_generation_mses.append(action_generation_mse.detach())
+
+        if was_training:
+            self.transformer.train()
+
+        if not latent_losses:
+            return None
+
+        latent_loss_mean = dist_mean(torch.stack(latent_losses).mean()).detach().cpu().item()
+        action_loss_mean = dist_mean(torch.stack(action_losses).mean()).detach().cpu().item()
+        action_generation_mse_mean = dist_mean(
+            torch.stack(action_generation_mses).mean()
+        ).detach().cpu().item()
+        return {
+            'latent_loss': latent_loss_mean,
+            'action_loss': action_loss_mean,
+            'action_generation_mse': action_generation_mse_mean,
+            'total_loss': latent_loss_mean + action_loss_mean,
+        }
+
     def compute_loss(self,
         input_dict,
-        pred
+        pred,
+        scale_by_grad_accum=True,
     ):
         latent_pred, action_pred = pred
         action_pred = rearrange(action_pred, 'b (f n) c -> b c f n 1', f=input_dict['action_dict']['targets'].shape[-3])
@@ -774,8 +1004,25 @@ class Trainer:
         action_loss_per_frame = action_loss.sum(dim=1)  # (B*F,)
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
+        binary_action_aux_loss = self._compute_binary_action_aux_loss(
+            action_pred,
+            input_dict['action_dict'],
+        )
+        self._last_binary_action_aux_loss = binary_action_aux_loss.detach()
+        action_loss = action_loss + (self.binary_action_aux_weight * binary_action_aux_loss)
 
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
+        with torch.no_grad():
+            action_generation_mse = self._compute_action_generation_mse(
+                action_pred,
+                input_dict['action_dict'],
+            )
+
+        loss_scale = self.gradient_accumulation_steps if scale_by_grad_accum else 1
+        return (
+            latent_loss / loss_scale,
+            action_loss / loss_scale,
+            action_generation_mse / loss_scale,
+        )
     def _train_step(self, batch, batch_idx):
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
@@ -800,7 +1047,7 @@ class Trainer:
             enabled=self._use_amp,
         ):
             output = self.transformer(input_dict, train_mode=True)
-            latent_loss, action_loss = self.compute_loss(input_dict, output)
+            latent_loss, action_loss, action_generation_mse = self.compute_loss(input_dict, output)
             loss = latent_loss + action_loss
 
         if self.step < 3 and batch_idx == 0:
@@ -820,6 +1067,8 @@ class Trainer:
         losses = {
             'latent_loss': latent_loss.detach(),
             'action_loss': action_loss.detach(),
+            'action_generation_mse': action_generation_mse.detach(),
+            'binary_action_aux_loss': self._last_binary_action_aux_loss.detach(),
         }
 
         if self.use_deepspeed:
@@ -1044,14 +1293,34 @@ class Trainer:
 
         # All ranks load the training state directly
         training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
+        self.step = int(training_state.get('step', 0))
 
-        # All ranks load optimizer state (required for FSDP)
-        set_optimizer_state_dict(
-            self.transformer, self.optimizer,
-            optim_state_dict=training_state['optimizer_state_dict'],
-            options=StateDictOptions(full_state_dict=True, strict=False)
-        )
-        self.step = training_state.get('step', 0)
+        # Restore optimizer state when possible. If model/optimizer param names
+        # changed across code versions, continue from model weights + step only.
+        optim_state = training_state.get('optimizer_state_dict')
+        if optim_state is None:
+            if self.config.rank == 0:
+                logger.warning(
+                    "Optimizer state not found in training_state.pt; "
+                    "resuming with freshly initialized optimizer at step %d.",
+                    self.step,
+                )
+        else:
+            try:
+                set_optimizer_state_dict(
+                    self.transformer,
+                    self.optimizer,
+                    optim_state_dict=optim_state,
+                    options=StateDictOptions(full_state_dict=True, strict=False),
+                )
+            except Exception as e:
+                if self.config.rank == 0:
+                    logger.warning(
+                        "Skipping optimizer state restore due to mismatch: %r. "
+                        "Continue from model weights at step %d with a fresh optimizer.",
+                        e,
+                        self.step,
+                    )
 
         if self.config.rank == 0:
             logger.info(f"Training state loaded, resuming from step {self.step}")
@@ -1080,6 +1349,8 @@ class Trainer:
             self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
+        accumulated_action_generation_mses = []
+        accumulated_binary_action_aux_losses = []
         step_in_accumulation = 0
 
         while self.step < self.config.num_steps:
@@ -1091,6 +1362,8 @@ class Trainer:
             # Accumulate losses for logging
             accumulated_latent_losses.append(losses['latent_loss'])
             accumulated_action_losses.append(losses['action_loss'])
+            accumulated_action_generation_mses.append(losses['action_generation_mse'])
+            accumulated_binary_action_aux_losses.append(losses['binary_action_aux_loss'])
             step_in_accumulation += 1
 
             # Log and checkpoint when optimizer steps
@@ -1103,12 +1376,18 @@ class Trainer:
                 # Average accumulated losses
                 latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                action_generation_mse_show = dist_mean(torch.stack(accumulated_action_generation_mses).sum()).detach().cpu().item()
+                binary_action_aux_loss_show = dist_mean(torch.stack(accumulated_binary_action_aux_losses).sum()).detach().cpu().item()
                 max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                max_action_generation_mse_show = dist_max(torch.stack(accumulated_action_generation_mses).sum()).detach().cpu().item()
+                max_binary_action_aux_loss_show = dist_max(torch.stack(accumulated_binary_action_aux_losses).sum()).detach().cpu().item()
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
+                accumulated_action_generation_mses = []
+                accumulated_binary_action_aux_losses = []
                 step_in_accumulation = 0
 
                 torch.cuda.synchronize()
@@ -1126,6 +1405,8 @@ class Trainer:
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
+                        'action_gen_mse': f'{action_generation_mse_show:.4f}',
+                        'binary_aux': f'{binary_action_aux_loss_show:.4f}',
                         'step': self.step,
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
@@ -1134,13 +1415,42 @@ class Trainer:
                         self.wandb.log({
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
                             'loss_metrics/global_avg_action_loss': action_loss_show,
+                            'loss_metrics/global_avg_action_generation_mse': action_generation_mse_show,
+                            'loss_metrics/global_avg_binary_action_aux_loss': binary_action_aux_loss_show,
                             'loss_metrics/global_max_video_loss': max_latent_loss_show,
                             'loss_metrics/global_max_action_loss': max_action_loss_show,
+                            'loss_metrics/global_max_action_generation_mse': max_action_generation_mse_show,
+                            'loss_metrics/global_max_binary_action_aux_loss': max_binary_action_aux_loss_show,
                             'grad_norm': total_norm.item(),
                             'lr': lr,
                         }, step=self.step)
                 
                 self.step += 1
+
+                if (
+                    self.val_loader is not None
+                    and self.validation_interval > 0
+                    and self.step % self.validation_interval == 0
+                ):
+                    if self.config.rank == 0:
+                        logger.info(f"Running validation at step {self.step}...")
+                    val_metrics = self.validate()
+                    if val_metrics is not None and self.config.rank == 0:
+                        logger.info(
+                            "Validation step %d | video_loss=%.6f | action_loss=%.6f | action_gen_mse=%.6f | total_loss=%.6f",
+                            self.step,
+                            val_metrics['latent_loss'],
+                            val_metrics['action_loss'],
+                            val_metrics['action_generation_mse'],
+                            val_metrics['total_loss'],
+                        )
+                        if self.config.enable_wandb:
+                            self.wandb.log({
+                                'val_metrics/video_loss': val_metrics['latent_loss'],
+                                'val_metrics/action_loss': val_metrics['action_loss'],
+                                'val_metrics/action_generation_mse': val_metrics['action_generation_mse'],
+                                'val_metrics/total_loss': val_metrics['total_loss'],
+                            }, step=self.step)
                 
                 if self.step % self.config.save_interval == 0:
                     if self.config.rank == 0:
