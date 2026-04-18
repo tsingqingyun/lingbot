@@ -10,7 +10,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import imageio
 import numpy as np
-
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 from wan_va.dataset.lerobot_latent_dataset import lingbot_to_robocasa, robocasa_to_lingbot
 
@@ -161,6 +160,50 @@ def summarize_episode_action_stats(executed_actions: List[np.ndarray], clipped_s
         stats["base_absdiff_mean"] = [0.0, 0.0, 0.0, 0.0]
         stats["base_absdiff_p95"] = [0.0, 0.0, 0.0, 0.0]
     return stats
+
+
+def summarize_chunk_prediction(
+    pred: np.ndarray,
+    action_30_batch: np.ndarray,
+    action_12_seq: np.ndarray,
+    step_count_before_chunk: int,
+    first_chunk: bool,
+) -> Dict[str, Any]:
+    action_30_seq = action_30_batch.reshape(pred.shape[1], pred.shape[2], 30)
+    gate_raw = action_30_seq[:, :, 29]
+    gripper_raw = action_30_seq[:, :, 14]
+    base = action_12_seq[:, :, 7:11].reshape(-1, 4)
+    control_mode = action_12_seq[:, :, 11].reshape(-1)
+    gripper_exec = action_12_seq[:, :, 6].reshape(-1)
+    start_idx = 1 if first_chunk else 0
+    executable_steps = max(0, pred.shape[2] * max(0, pred.shape[1] - start_idx))
+
+    base_absdiff = (
+        np.abs(np.diff(base, axis=0)) if base.shape[0] > 1 else np.zeros((0, 4), dtype=np.float32)
+    )
+    chunk_stats: Dict[str, Any] = {
+        "step_start": int(step_count_before_chunk),
+        "step_end_exclusive": int(step_count_before_chunk + executable_steps),
+        "pred_frames": int(pred.shape[1]),
+        "actions_per_frame": int(pred.shape[2]),
+        "first_chunk": bool(first_chunk),
+        "control_mode_raw_mean": float(gate_raw.mean()),
+        "control_mode_raw_min": float(gate_raw.min()),
+        "control_mode_raw_max": float(gate_raw.max()),
+        "control_mode_raw_positive_ratio": float(np.mean(gate_raw > 0.5)),
+        "control_mode_exec_positive_ratio": float(np.mean(control_mode > 0.5)),
+        "gripper_raw_positive_ratio": float(np.mean(gripper_raw > 0.5)),
+        "gripper_exec_positive_ratio": float(np.mean(gripper_exec > 0.5)),
+        "base_mean": base.mean(axis=0).astype(np.float64).tolist(),
+        "base_std": base.std(axis=0).astype(np.float64).tolist(),
+    }
+    if base_absdiff.shape[0] > 0:
+        chunk_stats["base_absdiff_mean"] = base_absdiff.mean(axis=0).astype(np.float64).tolist()
+        chunk_stats["base_absdiff_p95"] = np.quantile(base_absdiff, 0.95, axis=0).astype(np.float64).tolist()
+    else:
+        chunk_stats["base_absdiff_mean"] = [0.0, 0.0, 0.0, 0.0]
+        chunk_stats["base_absdiff_p95"] = [0.0, 0.0, 0.0, 0.0]
+    return chunk_stats
 
 
 def infer_success(info: Dict, terminated: bool) -> bool:
@@ -324,6 +367,8 @@ def run_episode(
     first = True
     executed_actions: List[np.ndarray] = []
     clipped_action_steps = 0
+    chunk_diagnostics: List[Dict[str, Any]] = []
+    mode_collapse_streak = 0
 
     while (not done) and (step_count < max_steps):
         server_obs = frame if first else next_frame
@@ -352,6 +397,28 @@ def run_episode(
         action_30_batch = used_channels_to_action30(action_used_batch)
         action_12_batch = lingbot_to_robocasa(action_30_batch)
         action_12_seq = action_12_batch.reshape(pred.shape[1], pred.shape[2], 12)
+        chunk_stats = summarize_chunk_prediction(
+            pred=pred,
+            action_30_batch=action_30_batch,
+            action_12_seq=action_12_seq,
+            step_count_before_chunk=step_count,
+            first_chunk=first,
+        )
+        chunk_diagnostics.append(chunk_stats)
+        mode_ratio = chunk_stats["control_mode_exec_positive_ratio"]
+        if mode_ratio <= 1e-6 or mode_ratio >= 1.0 - 1e-6:
+            mode_collapse_streak += 1
+        else:
+            mode_collapse_streak = 0
+        if mode_collapse_streak >= 4:
+            print(
+                "[Warn] control_mode collapse persists for "
+                f"{mode_collapse_streak} chunks: "
+                f"step_start={chunk_stats['step_start']} "
+                f"mode_ratio={mode_ratio:.4f} "
+                f"gate_raw_mean={chunk_stats['control_mode_raw_mean']:.4f} "
+                f"base_absdiff_mean={chunk_stats['base_absdiff_mean']}"
+            )
 
         key_frame_list = []
         start_idx = 1 if first else 0
@@ -409,6 +476,14 @@ def run_episode(
         first = False
 
     action_stats = summarize_episode_action_stats(executed_actions, clipped_action_steps)
+    action_stats["chunk_diagnostics"] = chunk_diagnostics
+    action_stats["mode_collapse_warning"] = bool(
+        any(
+            diag["control_mode_exec_positive_ratio"] <= 1e-6
+            or diag["control_mode_exec_positive_ratio"] >= 1.0 - 1e-6
+            for diag in chunk_diagnostics
+        )
+    )
     return success, step_count, frames_for_video, episode_prompt, action_stats
 
 
