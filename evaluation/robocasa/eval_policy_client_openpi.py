@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import imageio
 import numpy as np
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
+from wan_va.configs import get_config
 from wan_va.dataset.lerobot_latent_dataset import lingbot_to_robocasa, robocasa_to_lingbot
 
 
@@ -49,6 +50,10 @@ def _infer_used_action_channel_ids() -> List[int]:
 
 
 USED_ACTION_CHANNEL_IDS = _infer_used_action_channel_ids()
+CONTROL_MODE_COLLAPSE_EPS = 1e-6
+CONTROL_MODE_COLLAPSE_STREAK_THRESHOLD = 4
+CONTROL_MODE_REPLAN_COOLDOWN_STEPS = 32
+ROBOCASA_ACTION_PER_FRAME = int(get_config("robocasa").action_per_frame)
 
 
 def _find_obs_value(obs: Dict, candidates: Iterable[str]):
@@ -369,6 +374,8 @@ def run_episode(
     clipped_action_steps = 0
     chunk_diagnostics: List[Dict[str, Any]] = []
     mode_collapse_streak = 0
+    replan_count = 0
+    last_replan_step = -CONTROL_MODE_REPLAN_COOLDOWN_STEPS
 
     while (not done) and (step_count < max_steps):
         server_obs = frame if first else next_frame
@@ -392,6 +399,12 @@ def run_episode(
                 f"F=predicted frame chunks, H=actions per frame, and C={len(USED_ACTION_CHANNEL_IDS)}; "
                 f"got {pred.shape}"
             )
+        if pred.shape[2] != ROBOCASA_ACTION_PER_FRAME:
+            raise ValueError(
+                "RoboCasa action contract mismatch: "
+                f"server returned action_per_frame={pred.shape[2]}, "
+                f"but config expects {ROBOCASA_ACTION_PER_FRAME}."
+            )
 
         action_used_batch = pred.transpose(1, 2, 0).reshape(-1, pred.shape[0])
         action_30_batch = used_channels_to_action30(action_used_batch)
@@ -406,11 +419,14 @@ def run_episode(
         )
         chunk_diagnostics.append(chunk_stats)
         mode_ratio = chunk_stats["control_mode_exec_positive_ratio"]
-        if mode_ratio <= 1e-6 or mode_ratio >= 1.0 - 1e-6:
+        if (
+            mode_ratio <= CONTROL_MODE_COLLAPSE_EPS
+            or mode_ratio >= 1.0 - CONTROL_MODE_COLLAPSE_EPS
+        ):
             mode_collapse_streak += 1
         else:
             mode_collapse_streak = 0
-        if mode_collapse_streak >= 4:
+        if mode_collapse_streak >= CONTROL_MODE_COLLAPSE_STREAK_THRESHOLD:
             print(
                 "[Warn] control_mode collapse persists for "
                 f"{mode_collapse_streak} chunks: "
@@ -453,6 +469,26 @@ def run_episode(
             if done or step_count >= max_steps:
                 break
 
+        should_replan = (
+            (not done)
+            and mode_collapse_streak >= CONTROL_MODE_COLLAPSE_STREAK_THRESHOLD
+            and (step_count - last_replan_step) >= CONTROL_MODE_REPLAN_COOLDOWN_STEPS
+        )
+        if should_replan:
+            print(
+                "[Info] Triggering replanning after persistent control_mode collapse: "
+                f"step={step_count} "
+                f"streak={mode_collapse_streak} "
+                f"gate_raw_mean={chunk_stats['control_mode_raw_mean']:.4f}"
+            )
+            model.infer(dict(reset=True, prompt=episode_prompt))
+            replan_count += 1
+            last_replan_step = step_count
+            mode_collapse_streak = 0
+            next_frame = frame
+            first = True
+            continue
+
         if key_frame_list:
             # Warm VAE caches can hit multiple temporal downsample stages.
             # In practice this path needs >=4 frames for robust conv3d(k=3) validity.
@@ -477,10 +513,14 @@ def run_episode(
 
     action_stats = summarize_episode_action_stats(executed_actions, clipped_action_steps)
     action_stats["chunk_diagnostics"] = chunk_diagnostics
+    action_stats["replan_count"] = int(replan_count)
+    action_stats["control_mode_collapse_streak_threshold"] = int(
+        CONTROL_MODE_COLLAPSE_STREAK_THRESHOLD
+    )
     action_stats["mode_collapse_warning"] = bool(
         any(
-            diag["control_mode_exec_positive_ratio"] <= 1e-6
-            or diag["control_mode_exec_positive_ratio"] >= 1.0 - 1e-6
+            diag["control_mode_exec_positive_ratio"] <= CONTROL_MODE_COLLAPSE_EPS
+            or diag["control_mode_exec_positive_ratio"] >= 1.0 - CONTROL_MODE_COLLAPSE_EPS
             for diag in chunk_diagnostics
         )
     )
