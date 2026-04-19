@@ -12,7 +12,11 @@ import imageio
 import numpy as np
 
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
-from wan_va.dataset.lerobot_latent_dataset import lingbot_to_robocasa, robocasa_to_lingbot
+from wan_va.dataset.lerobot_latent_dataset import (
+    get_robocasa_binarize_thresholds,
+    lingbot_to_robocasa,
+    robocasa_to_lingbot,
+)
 
 
 DEFAULT_OBS_KEY_CANDIDATES = {
@@ -50,6 +54,7 @@ def _infer_used_action_channel_ids() -> List[int]:
 
 
 USED_ACTION_CHANNEL_IDS = _infer_used_action_channel_ids()
+BIN_THRESHOLDS = get_robocasa_binarize_thresholds()
 
 
 def _find_obs_value(obs: Dict, candidates: Iterable[str]):
@@ -141,6 +146,7 @@ def summarize_episode_action_stats(executed_actions: List[np.ndarray], clipped_s
     arr = np.asarray(executed_actions, dtype=np.float32).reshape(-1, 12)
     base = arr[:, 7:11]
     mode = arr[:, 11]
+    gripper = arr[:, 6]
 
     base_absdiff = np.abs(np.diff(base, axis=0)) if arr.shape[0] > 1 else np.zeros((0, 4), dtype=np.float32)
     mode_change_rate = float(np.mean(mode[1:] != mode[:-1])) if mode.shape[0] > 1 else 0.0
@@ -150,7 +156,9 @@ def summarize_episode_action_stats(executed_actions: List[np.ndarray], clipped_s
         "clipped_action_steps": int(clipped_steps),
         "clipped_action_ratio": float(clipped_steps / max(1, arr.shape[0])),
         "mode_change_rate": mode_change_rate,
-        "mode_positive_ratio": float(np.mean(mode > 0.5)),
+        "mode_positive_ratio": float(np.mean(mode > 0.0)),
+        "gripper_positive_ratio": float(np.mean(gripper > 0.0)),
+        "binarize_thresholds": BIN_THRESHOLDS,
         "base_mean": base.mean(axis=0).astype(np.float64).tolist(),
         "base_std": base.std(axis=0).astype(np.float64).tolist(),
     }
@@ -493,6 +501,7 @@ def main():
             f"[Episode {ep + 1}/{args.n_episodes}] "
             f"success={ok} steps={steps} "
             f"mode_change_rate={action_stats.get('mode_change_rate', 0.0):.4f} "
+            f"gripper_positive_ratio={action_stats.get('gripper_positive_ratio', 0.0):.4f} "
             f"clip_ratio={action_stats.get('clipped_action_ratio', 0.0):.4f} "
             f"running_sr={succ / (ep + 1):.4f}"
         )

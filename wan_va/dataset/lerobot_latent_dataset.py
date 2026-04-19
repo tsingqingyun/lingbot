@@ -29,6 +29,33 @@ def _env_truthy(name: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+ROBOCASA_GRIPPER_BIN_THRESHOLD = _env_float(
+    "LINGBOT_ROBOCASA_GRIPPER_THRESHOLD",
+    0.0,
+)
+ROBOCASA_CONTROL_MODE_BIN_THRESHOLD = _env_float(
+    "LINGBOT_ROBOCASA_CONTROL_MODE_THRESHOLD",
+    0.0,
+)
+
+
+def get_robocasa_binarize_thresholds():
+    return {
+        "gripper": float(ROBOCASA_GRIPPER_BIN_THRESHOLD),
+        "control_mode": float(ROBOCASA_CONTROL_MODE_BIN_THRESHOLD),
+    }
+
+
 def _is_torch(x) -> bool:
     return torch.is_tensor(x)
 
@@ -229,9 +256,12 @@ def lingbot_to_robocasa(action_30):
     """
     LingBot-VA 30D -> RoboCasa 12D
 
-        语义约定（与 RoboCasa wrapper 一致）：
-        - gripper_close / control_mode 采用 0.5 阈值二值化，再映射为 {-1, +1}
-            （wrapper 内部判断同样使用 <0.5 / >=0.5）。
+        语义约定：
+        - gripper_close / control_mode 在 LingBot 30D 里为近似 {-1,+1}，
+          默认按 0.0 阈值做二值化，再映射为 {-1,+1}。
+        - 可用环境变量覆盖：
+          LINGBOT_ROBOCASA_GRIPPER_THRESHOLD
+          LINGBOT_ROBOCASA_CONTROL_MODE_THRESHOLD
     """
     action_30 = _to_float_array(action_30)
     last_dim = action_30.shape[-1]
@@ -247,9 +277,17 @@ def lingbot_to_robocasa(action_30):
     out[..., 3:6] = quat_xyzw_to_axisangle(action_30[..., 3:7])
     gripper = action_30[..., 14]
     if _is_torch(action_30):
-        out[..., 6] = torch.where(gripper > 0.5, torch.ones_like(gripper), -torch.ones_like(gripper))
+        out[..., 6] = torch.where(
+            gripper > ROBOCASA_GRIPPER_BIN_THRESHOLD,
+            torch.ones_like(gripper),
+            -torch.ones_like(gripper),
+        )
     else:
-        out[..., 6] = np.where(gripper > 0.5, 1.0, -1.0).astype(np.float32)
+        out[..., 6] = np.where(
+            gripper > ROBOCASA_GRIPPER_BIN_THRESHOLD,
+            1.0,
+            -1.0,
+        ).astype(np.float32)
 
     # 底盘/躯干：从副臂被劫持的槽位取回
     out[..., 7:9] = action_30[..., 15:17]
@@ -258,9 +296,17 @@ def lingbot_to_robocasa(action_30):
 
     gate = action_30[..., 29]
     if _is_torch(action_30):
-        out[..., 11] = torch.where(gate > 0.5, torch.ones_like(gate), -torch.ones_like(gate))
+        out[..., 11] = torch.where(
+            gate > ROBOCASA_CONTROL_MODE_BIN_THRESHOLD,
+            torch.ones_like(gate),
+            -torch.ones_like(gate),
+        )
     else:
-        out[..., 11] = np.where(gate > 0.5, 1.0, -1.0).astype(np.float32)
+        out[..., 11] = np.where(
+            gate > ROBOCASA_CONTROL_MODE_BIN_THRESHOLD,
+            1.0,
+            -1.0,
+        ).astype(np.float32)
 
     return out
 

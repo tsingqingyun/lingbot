@@ -49,6 +49,7 @@ from utils import (
 )
 
 from .dataset import MultiLatentLeRobotDataset
+from .dataset.lerobot_latent_dataset import get_robocasa_binarize_thresholds
 import gc
 
 
@@ -311,6 +312,17 @@ class Trainer:
         self.binary_action_aux_loss_type = str(
             getattr(config, "binary_action_aux_loss_type", "bce")
         ).lower()
+        default_binary_thresholds = get_robocasa_binarize_thresholds()
+        self.binary_action_aux_threshold = float(
+            getattr(
+                config,
+                "binary_action_aux_threshold",
+                default_binary_thresholds.get("gripper", 0.0),
+            )
+        )
+        self.binary_action_aux_logit_scale = float(
+            getattr(config, "binary_action_aux_logit_scale", 8.0)
+        )
         self._last_binary_action_aux_loss = torch.tensor(0.0, device=self.device)
 
         # Load models
@@ -820,13 +832,22 @@ class Trainer:
         recon_sel = action_recon[:, valid_channels]
         target_sel = action_target[:, valid_channels]
         mask_sel = action_mask[:, valid_channels]
-        target_bin = (target_sel > 0.0).float()
-
-        prob = torch.clamp((recon_sel + 1.0) * 0.5, 1e-5, 1.0 - 1e-5)
+        target_bin = (target_sel > self.binary_action_aux_threshold).float()
+        logits = (recon_sel - self.binary_action_aux_threshold) * max(
+            self.binary_action_aux_logit_scale,
+            1e-6,
+        )
+        prob = torch.sigmoid(logits)
         pos_w = max(self.binary_action_aux_pos_weight, 1e-6)
-        bce = -(
-            pos_w * target_bin * torch.log(prob)
-            + (1.0 - target_bin) * torch.log(1.0 - prob)
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            target_bin,
+            pos_weight=torch.as_tensor(
+                pos_w,
+                device=logits.device,
+                dtype=logits.dtype,
+            ),
+            reduction='none',
         )
         if self.binary_action_aux_loss_type == "focal":
             pt = torch.where(target_bin > 0.5, prob, 1.0 - prob)
