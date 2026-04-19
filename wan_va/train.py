@@ -137,6 +137,33 @@ def _collate_pad_batch(batch):
     if len(batch) == 0:
         return {}
 
+    # Fast path for bs=1: avoid variable-length padding logic entirely.
+    # This keeps masks/training targets on the exact original timeline.
+    if len(batch) == 1:
+        sample = batch[0]
+        out = {}
+        for k, v in sample.items():
+            if torch.is_tensor(v):
+                out[k] = v.unsqueeze(0)
+            else:
+                out[k] = [v]
+
+        if 'latents' in sample and 'latents_mask' not in out:
+            f = int(sample['latents'].shape[1])
+            out['latents_mask'] = torch.ones(
+                (1, 1, f, 1, 1),
+                dtype=torch.bool,
+                device=sample['latents'].device,
+            )
+        if 'text_emb' in sample and 'text_mask' not in out:
+            l = int(sample['text_emb'].shape[0])
+            out['text_mask'] = torch.ones(
+                (1, l),
+                dtype=torch.bool,
+                device=sample['text_emb'].device,
+            )
+        return out
+
     out = {}
     keys = batch[0].keys()
 
