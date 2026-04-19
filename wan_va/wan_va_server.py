@@ -111,6 +111,40 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+        self.video_guidance_scale = float(getattr(self.job_config, "guidance_scale", 1.0))
+        self.action_guidance_scale = float(getattr(self.job_config, "action_guidance_scale", 1.0))
+        self.use_cfg = (self.video_guidance_scale > 1.0) or (self.action_guidance_scale > 1.0)
+
+    def _set_runtime_guidance_scales(
+        self,
+        video_guidance_scale=None,
+        action_guidance_scale=None,
+        allow_cfg_mode_change=False,
+    ):
+        old_video = float(self.video_guidance_scale)
+        old_action = float(self.action_guidance_scale)
+        old_use_cfg = bool(self.use_cfg)
+
+        new_video = old_video if video_guidance_scale is None else float(video_guidance_scale)
+        new_action = old_action if action_guidance_scale is None else float(action_guidance_scale)
+        new_use_cfg = (new_video > 1.0) or (new_action > 1.0)
+
+        if (new_use_cfg != old_use_cfg) and (not allow_cfg_mode_change):
+            logger.warning(
+                "Ignore runtime guidance update that changes CFG mode without reset: "
+                "old(video=%.3f, action=%.3f, use_cfg=%s) -> new(video=%.3f, action=%.3f, use_cfg=%s)",
+                old_video,
+                old_action,
+                old_use_cfg,
+                new_video,
+                new_action,
+                new_use_cfg,
+            )
+            return
+
+        self.video_guidance_scale = new_video
+        self.action_guidance_scale = new_action
+        self.use_cfg = new_use_cfg
 
     def _get_t5_prompt_embeds(
         self,
@@ -376,12 +410,13 @@ class VA_Server:
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
-        if len(images) < 1:
+        real_frame_count = len(images)
+        if real_frame_count < 1:
             return None
         min_obs_frames = self._min_obs_frames_for_encode()
-        if len(images) < min_obs_frames:
+        if real_frame_count < min_obs_frames:
             # Warm-cache encode needs enough frames for stacked temporal downsample.
-            pad_count = min_obs_frames - len(images)
+            pad_count = min_obs_frames - real_frame_count
             images = [copy.deepcopy(images[0]) for _ in range(pad_count)] + images
         videos = []
         for k_i, k in enumerate(self.job_config.obs_cam_keys):
@@ -427,11 +462,26 @@ class VA_Server:
         latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
         mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+        # Padding frames are only for temporal conv context; keep real timeline length.
+        if (
+            real_frame_count > 0
+            and video_latent.shape[2] > real_frame_count
+        ):
+            video_latent = video_latent[:, :, -real_frame_count:]
         return video_latent.to(self.device)
 
-    def _reset(self, prompt=None):
+    def _reset(
+        self,
+        prompt=None,
+        video_guidance_scale=None,
+        action_guidance_scale=None,
+    ):
         logger.info('Reset.')
-        self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
+        self._set_runtime_guidance_scales(
+            video_guidance_scale=video_guidance_scale,
+            action_guidance_scale=action_guidance_scale,
+            allow_cfg_mode_change=True,
+        )
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
@@ -481,7 +531,7 @@ class VA_Server:
             self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=None,
-                do_classifier_free_guidance=self.job_config.guidance_scale > 1,
+                do_classifier_free_guidance=self.use_cfg,
                 num_videos_per_prompt=1,
                 prompt_embeds=None,
                 negative_prompt_embeds=None,
@@ -565,8 +615,8 @@ class VA_Server:
                         self.job_config.patch_size, video_noise_pred,
                         frame_chunk_size, self.latent_height,
                         self.latent_width, batch_size=2 if self.use_cfg else 1)
-                    if self.job_config.guidance_scale > 1:
-                        video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                    if self.video_guidance_scale > 1:
+                        video_noise_pred = video_noise_pred[1:] + self.video_guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
                     else:
                         video_noise_pred = video_noise_pred[:1]
                     latents = self.scheduler.step(video_noise_pred,
@@ -604,8 +654,8 @@ class VA_Server:
                     action_noise_pred = rearrange(action_noise_pred,
                                                   'b (f n) c -> b c f n 1',
                                                   f=frame_chunk_size)
-                    if self.job_config.action_guidance_scale > 1:
-                        action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
+                    if self.action_guidance_scale > 1:
+                        action_noise_pred = action_noise_pred[1:] + self.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
                     else:
                         action_noise_pred = action_noise_pred[:1]
                     actions = self.action_scheduler.step(action_noise_pred,
@@ -663,18 +713,34 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        video_guidance_scale = obs.get('video_guidance_scale', None)
+        action_guidance_scale = obs.get('action_guidance_scale', None)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
-            self._reset(prompt=prompt)
+            self._reset(
+                prompt=prompt,
+                video_guidance_scale=video_guidance_scale,
+                action_guidance_scale=action_guidance_scale,
+            )
             return dict()
         elif compute_kv_cache:
             logger.info(
                 f"################# Compute KV Cache #################")
+            self._set_runtime_guidance_scales(
+                video_guidance_scale=video_guidance_scale,
+                action_guidance_scale=action_guidance_scale,
+                allow_cfg_mode_change=False,
+            )
             self._compute_kv_cache(obs)
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
+            self._set_runtime_guidance_scales(
+                video_guidance_scale=video_guidance_scale,
+                action_guidance_scale=action_guidance_scale,
+                allow_cfg_mode_change=False,
+            )
             action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     

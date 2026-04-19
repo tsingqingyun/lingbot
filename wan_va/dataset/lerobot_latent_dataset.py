@@ -29,6 +29,33 @@ def _env_truthy(name: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+ROBOCASA_GRIPPER_BIN_THRESHOLD = _env_float(
+    "LINGBOT_ROBOCASA_GRIPPER_THRESHOLD",
+    0.0,
+)
+ROBOCASA_CONTROL_MODE_BIN_THRESHOLD = _env_float(
+    "LINGBOT_ROBOCASA_CONTROL_MODE_THRESHOLD",
+    0.0,
+)
+
+
+def get_robocasa_binarize_thresholds():
+    return {
+        "gripper": float(ROBOCASA_GRIPPER_BIN_THRESHOLD),
+        "control_mode": float(ROBOCASA_CONTROL_MODE_BIN_THRESHOLD),
+    }
+
+
 def _is_torch(x) -> bool:
     return torch.is_tensor(x)
 
@@ -179,14 +206,15 @@ def robocasa_to_lingbot(action_12):
     """
     RoboCasa 12D -> LingBot-VA 30D
 
-    RoboCasa(12):
-      0:3   EEF XYZ
-      3:6   EEF 旋转 Axis-angle(rotvec)
-      6     Gripper
-      7:9   Base XY
-      9     Base Yaw
-      10    Torso Z
-      11    Gate（模式）
+    RoboCasa(12) / modality.json:
+      0:4   base_motion
+            0:2 Base XY
+            2   Base Yaw
+            3   Torso Z
+      4     control_mode
+      5:8   end_effector_position (EEF XYZ)
+      8:11  end_effector_rotation Axis-angle(rotvec)
+      11    gripper_close
 
     LingBot(30): 右臂(0:15) + 左臂(15:30)，每臂 15:
       [XYZ(3), Quat(4), J1..J7(7), Gripper(1)]
@@ -203,19 +231,19 @@ def robocasa_to_lingbot(action_12):
         mask = np.zeros((*action_12.shape[:-1], 30), dtype=bool)
 
     # --- 主臂（右臂 0~14） ---
-    out[..., 0:3] = action_12[..., 0:3]
-    out[..., 3:7] = axisangle_to_quat_xyzw(action_12[..., 3:6])
-    out[..., 14] = action_12[..., 6]
+    out[..., 0:3] = action_12[..., 5:8]
+    out[..., 3:7] = axisangle_to_quat_xyzw(action_12[..., 8:11])
+    out[..., 14] = action_12[..., 11]
 
     mask[..., 0:3] = True
     mask[..., 3:7] = True
     mask[..., 14] = True
 
     # --- 副臂（左臂 15~29），用空槽位塞底盘/躯干 ---
-    out[..., 15:17] = action_12[..., 7:9]   # base XY
-    out[..., 17] = action_12[..., 10]      # torso Z
-    out[..., 22] = action_12[..., 9]       # base yaw -> 副臂 J1
-    out[..., 29] = action_12[..., 11]       # gate -> 副臂 gripper
+    out[..., 15:17] = action_12[..., 0:2]   # base XY
+    out[..., 17] = action_12[..., 3]        # torso Z
+    out[..., 22] = action_12[..., 2]        # base yaw -> 副臂 J1
+    out[..., 29] = action_12[..., 4]        # control_mode -> 副臂 gripper
 
     mask[..., 15:17] = True
     mask[..., 17] = True
@@ -229,9 +257,12 @@ def lingbot_to_robocasa(action_30):
     """
     LingBot-VA 30D -> RoboCasa 12D
 
-        语义约定（与 RoboCasa wrapper 一致）：
-        - gripper_close / control_mode 采用 0.5 阈值二值化，再映射为 {-1, +1}
-            （wrapper 内部判断同样使用 <0.5 / >=0.5）。
+        语义约定：
+        - gripper_close / control_mode 在 LingBot 30D 里为近似 {-1,+1}，
+          默认按 0.0 阈值做二值化，再映射为 {-1,+1}。
+        - 可用环境变量覆盖：
+          LINGBOT_ROBOCASA_GRIPPER_THRESHOLD
+          LINGBOT_ROBOCASA_CONTROL_MODE_THRESHOLD
     """
     action_30 = _to_float_array(action_30)
     last_dim = action_30.shape[-1]
@@ -242,25 +273,41 @@ def lingbot_to_robocasa(action_30):
     else:
         out = np.zeros((*action_30.shape[:-1], 12), dtype=np.float32)
 
-    # 主臂：EEF XYZ + Quat->Axis-angle + Gripper
-    out[..., 0:3] = action_30[..., 0:3]
-    out[..., 3:6] = quat_xyzw_to_axisangle(action_30[..., 3:7])
+    # end-effector: EEF XYZ + Quat->Axis-angle
+    out[..., 5:8] = action_30[..., 0:3]
+    out[..., 8:11] = quat_xyzw_to_axisangle(action_30[..., 3:7])
     gripper = action_30[..., 14]
     if _is_torch(action_30):
-        out[..., 6] = torch.where(gripper > 0.5, torch.ones_like(gripper), -torch.ones_like(gripper))
+        out[..., 11] = torch.where(
+            gripper > ROBOCASA_GRIPPER_BIN_THRESHOLD,
+            torch.ones_like(gripper),
+            -torch.ones_like(gripper),
+        )
     else:
-        out[..., 6] = np.where(gripper > 0.5, 1.0, -1.0).astype(np.float32)
+        out[..., 11] = np.where(
+            gripper > ROBOCASA_GRIPPER_BIN_THRESHOLD,
+            1.0,
+            -1.0,
+        ).astype(np.float32)
 
-    # 底盘/躯干：从副臂被劫持的槽位取回
-    out[..., 7:9] = action_30[..., 15:17]
-    out[..., 10] = action_30[..., 17]
-    out[..., 9] = action_30[..., 22]
+    # base/control_mode：从副臂被劫持的槽位取回
+    out[..., 0:2] = action_30[..., 15:17]
+    out[..., 3] = action_30[..., 17]
+    out[..., 2] = action_30[..., 22]
 
     gate = action_30[..., 29]
     if _is_torch(action_30):
-        out[..., 11] = torch.where(gate > 0.5, torch.ones_like(gate), -torch.ones_like(gate))
+        out[..., 4] = torch.where(
+            gate > ROBOCASA_CONTROL_MODE_BIN_THRESHOLD,
+            torch.ones_like(gate),
+            -torch.ones_like(gate),
+        )
     else:
-        out[..., 11] = np.where(gate > 0.5, 1.0, -1.0).astype(np.float32)
+        out[..., 4] = np.where(
+            gate > ROBOCASA_CONTROL_MODE_BIN_THRESHOLD,
+            1.0,
+            -1.0,
+        ).astype(np.float32)
 
     return out
 
@@ -882,6 +929,44 @@ class LatentLeRobotDataset(LeRobotDataset):
             action_mask_30 = rearrange(action_mask_30, "(f n) c -> c f n 1", f=latent_frame_num)
 
             return torch.from_numpy(action_30).float(), torch.from_numpy(action_mask_30).bool()
+
+        elif self.config.env_type in ('none', 'libero'):
+            # Generic branch used by LIBERO and other datasets that already provide
+            # policy action vectors aligned with config.used_action_channel_ids.
+            if action.ndim != 2:
+                raise ValueError(f"Expected 2D action [T, D], got shape {action.shape}")
+
+            action = np.pad(
+                action,
+                pad_width=((frame_stride * 4, 0), (0, 0)),
+                mode='constant',
+                constant_values=0
+            )
+
+            latent_frame_num = (len(latent_frame_ids) - 1) // 4 + 1
+            required_action_num = latent_frame_num * frame_stride * 4
+            action = action[:required_action_num]
+            action_mask = np.ones_like(action, dtype='bool')
+
+            if action.shape[0] != required_action_num:
+                raise ValueError(
+                    f"Action length mismatch: got {action.shape[0]}, expect {required_action_num}"
+                )
+
+            action_paded = np.pad(action, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+            action_mask_padded = np.pad(action_mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+
+            action_aligned = action_paded[:, self.config.inverse_used_action_channel_ids]
+            action_mask_aligned = action_mask_padded[:, self.config.inverse_used_action_channel_ids]
+
+            action_aligned = (action_aligned - self.q01) / (self.q99 - self.q01 + 1e-6) * 2. - 1.
+            action_aligned = np.clip(action_aligned, -1.5, 1.5)
+
+            action_aligned = rearrange(action_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
+            action_mask_aligned = rearrange(action_mask_aligned, "(f n) c -> c f n 1", f=latent_frame_num)
+            action_aligned *= action_mask_aligned
+
+            return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
 
         else:
             raise NotImplementedError(f"Unsupported env_type: {self.config.env_type}")

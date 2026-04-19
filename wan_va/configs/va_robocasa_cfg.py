@@ -12,9 +12,17 @@ va_robocasa_cfg.update(va_shared_cfg)
 va_robocasa_cfg.wan22_pretrained_model_name_or_path = (
     os.environ.get(
         "LINGBOT_ROBOCASA_MODEL_PATH",
-        "/cephfs/shared/xcxhx/lingbot-va",
-        #"/cephfs/shared/xcx/lingbot-va/train_out/checkpoint_step_500",
+        #"/cephfs/shared/xcxhx/lingbot-va",
+        "/cephfs/shared/xcx/lingbot-va/train_out/checkpoint_step_500",
     )
+)
+# Optional: checkpoint directory for resume/finetune.
+# Expected layout:
+#   <resume_from>/transformer/
+#   <resume_from>/training_state.pt (optional, for optimizer/step restore)
+va_robocasa_cfg.resume_from = os.environ.get(
+    "LINGBOT_ROBOCASA_RESUME_FROM",
+    None,
 )
 # Full Wan tree: vae/, tokenizer/, text_encoder/.
 va_robocasa_cfg.wan22_base_pretrained_model_name_or_path = os.environ.get(
@@ -30,7 +38,7 @@ va_robocasa_cfg.env_type = 'robocasa_tshape'
 va_robocasa_cfg.height = 256
 va_robocasa_cfg.width = 256
 va_robocasa_cfg.action_dim = 30
-va_robocasa_cfg.action_per_frame = 16
+va_robocasa_cfg.action_per_frame = 8
 va_robocasa_cfg.obs_cam_keys = [
     'observation.images.robot0_agentview_left', 'observation.images.robot0_agentview_right',
     'observation.images.robot0_eye_in_hand'
@@ -60,29 +68,29 @@ va_robocasa_cfg.inverse_used_action_channel_ids = inverse_used_action_channel_id
 va_robocasa_cfg.action_norm_method = 'quantiles'
 va_robocasa_cfg.norm_stat = {
     "q01": [
+    -1.0,
+    -1.0,
+    -1.0,
+    -0.19411402940750122,
+    -0.208142052590847,
+    -0.19713866859674453,
+    0.9403075903654099,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    -1.0,
     -0.5142857432365417,
     -0.8642857074737549,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
     -0.5199999809265137,
-    -0.22984884679317474,
-    -0.4794255495071411,
-    -0.4207354784011841,
-    0.7701511383056641,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    -1.0,
-    -1.0,
-    -0.39142856001853943,
-    -0.39714285731315613,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    -0.41999998688697815,
     0.0,
     0.0,
     0.0,
@@ -94,27 +102,27 @@ va_robocasa_cfg.norm_stat = {
     "q99": [
     1.0,
     1.0,
+    1.0,
+    0.1506267488002777,
+    0.16056651771068553,
+    0.21542802453041077,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
     0.4657142758369446,
-    0.22984884679317474,
-    0.4794255495071411,
-    0.4207354784011841,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-    0.3028571307659149,
-    0.43714284896850586,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-    0.322857141494751,
     1.0,
     1.0,
     1.0,

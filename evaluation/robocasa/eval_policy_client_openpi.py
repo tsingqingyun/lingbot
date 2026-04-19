@@ -12,7 +12,11 @@ import imageio
 import numpy as np
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 from wan_va.configs import get_config
-from wan_va.dataset.lerobot_latent_dataset import lingbot_to_robocasa, robocasa_to_lingbot
+from wan_va.dataset.lerobot_latent_dataset import (
+    get_robocasa_binarize_thresholds,
+    lingbot_to_robocasa,
+    robocasa_to_lingbot,
+)
 
 
 DEFAULT_OBS_KEY_CANDIDATES = {
@@ -50,9 +54,7 @@ def _infer_used_action_channel_ids() -> List[int]:
 
 
 USED_ACTION_CHANNEL_IDS = _infer_used_action_channel_ids()
-CONTROL_MODE_COLLAPSE_EPS = 1e-6
-CONTROL_MODE_COLLAPSE_STREAK_THRESHOLD = 4
-CONTROL_MODE_REPLAN_COOLDOWN_STEPS = 32
+BIN_THRESHOLDS = get_robocasa_binarize_thresholds()
 ROBOCASA_ACTION_PER_FRAME = int(get_config("robocasa").action_per_frame)
 
 
@@ -145,6 +147,7 @@ def summarize_episode_action_stats(executed_actions: List[np.ndarray], clipped_s
     arr = np.asarray(executed_actions, dtype=np.float32).reshape(-1, 12)
     base = arr[:, 7:11]
     mode = arr[:, 11]
+    gripper = arr[:, 6]
 
     base_absdiff = np.abs(np.diff(base, axis=0)) if arr.shape[0] > 1 else np.zeros((0, 4), dtype=np.float32)
     mode_change_rate = float(np.mean(mode[1:] != mode[:-1])) if mode.shape[0] > 1 else 0.0
@@ -154,7 +157,10 @@ def summarize_episode_action_stats(executed_actions: List[np.ndarray], clipped_s
         "clipped_action_steps": int(clipped_steps),
         "clipped_action_ratio": float(clipped_steps / max(1, arr.shape[0])),
         "mode_change_rate": mode_change_rate,
-        "mode_positive_ratio": float(np.mean(mode > 0.5)),
+        "mode_positive_ratio": float(np.mean(mode > 0.0)),
+        "gripper_positive_ratio": float(np.mean(gripper > 0.0)),
+        "binarize_thresholds": BIN_THRESHOLDS,
+        "configured_action_per_frame": int(ROBOCASA_ACTION_PER_FRAME),
         "base_mean": base.mean(axis=0).astype(np.float64).tolist(),
         "base_std": base.std(axis=0).astype(np.float64).tolist(),
     }
@@ -364,7 +370,14 @@ def run_episode(
     frame = format_obs_for_lingbot(obs)
     frames_for_video = [frame["observation.images.robot0_agentview_left"]]
 
-    model.infer(dict(reset=True, prompt=episode_prompt))
+    model.infer(
+        dict(
+            reset=True,
+            prompt=episode_prompt,
+            video_guidance_scale=video_guidance_scale,
+            action_guidance_scale=action_guidance_scale,
+        )
+    )
 
     done = False
     success = False
@@ -490,23 +503,15 @@ def run_episode(
             continue
 
         if key_frame_list:
-            # Warm VAE caches can hit multiple temporal downsample stages.
-            # In practice this path needs >=4 frames for robust conv3d(k=3) validity.
-            min_kv_cache_frames = max(4, pred.shape[1])
-            cache_frames = list(key_frame_list)
-            if len(cache_frames) < min_kv_cache_frames:
-                padding_count = min_kv_cache_frames - len(cache_frames)
-                cache_frames = [copy.deepcopy(server_obs) for _ in range(padding_count)] + cache_frames
-
             model.infer(
                 dict(
-                    obs=cache_frames,
+                    obs=key_frame_list,
                     compute_kv_cache=True,
                     imagine=False,
                     state=np.asarray(pred, dtype=np.float32),
                 )
             )
-            next_frame = cache_frames[-1]
+            next_frame = key_frame_list[-1]
         else:
             next_frame = frame
         first = False
@@ -608,6 +613,7 @@ def main():
             f"[Episode {ep + 1}/{args.n_episodes}] "
             f"success={ok} steps={steps} "
             f"mode_change_rate={action_stats.get('mode_change_rate', 0.0):.4f} "
+            f"gripper_positive_ratio={action_stats.get('gripper_positive_ratio', 0.0):.4f} "
             f"clip_ratio={action_stats.get('clipped_action_ratio', 0.0):.4f} "
             f"running_sr={succ / (ep + 1):.4f}"
         )
