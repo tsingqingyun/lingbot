@@ -12,6 +12,7 @@ import imageio
 import numpy as np
 
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
+from wan_va.configs import get_config
 from wan_va.dataset.lerobot_latent_dataset import (
     get_robocasa_binarize_thresholds,
     lingbot_to_robocasa,
@@ -55,6 +56,7 @@ def _infer_used_action_channel_ids() -> List[int]:
 
 USED_ACTION_CHANNEL_IDS = _infer_used_action_channel_ids()
 BIN_THRESHOLDS = get_robocasa_binarize_thresholds()
+ROBOCASA_ACTION_PER_FRAME = int(get_config("robocasa").action_per_frame)
 
 
 def _find_obs_value(obs: Dict, candidates: Iterable[str]):
@@ -159,6 +161,7 @@ def summarize_episode_action_stats(executed_actions: List[np.ndarray], clipped_s
         "mode_positive_ratio": float(np.mean(mode > 0.0)),
         "gripper_positive_ratio": float(np.mean(gripper > 0.0)),
         "binarize_thresholds": BIN_THRESHOLDS,
+        "configured_action_per_frame": int(ROBOCASA_ACTION_PER_FRAME),
         "base_mean": base.mean(axis=0).astype(np.float64).tolist(),
         "base_std": base.std(axis=0).astype(np.float64).tolist(),
     }
@@ -324,7 +327,14 @@ def run_episode(
     frame = format_obs_for_lingbot(obs)
     frames_for_video = [frame["observation.images.robot0_agentview_left"]]
 
-    model.infer(dict(reset=True, prompt=episode_prompt))
+    model.infer(
+        dict(
+            reset=True,
+            prompt=episode_prompt,
+            video_guidance_scale=video_guidance_scale,
+            action_guidance_scale=action_guidance_scale,
+        )
+    )
 
     done = False
     success = False
@@ -354,6 +364,12 @@ def run_episode(
                 f"Expected action shape [C,F,H] where C=used action channels, "
                 f"F=predicted frame chunks, H=actions per frame, and C={len(USED_ACTION_CHANNEL_IDS)}; "
                 f"got {pred.shape}"
+            )
+        if pred.shape[2] != ROBOCASA_ACTION_PER_FRAME:
+            raise ValueError(
+                "RoboCasa action contract mismatch: "
+                f"server returned action_per_frame={pred.shape[2]}, "
+                f"but config expects {ROBOCASA_ACTION_PER_FRAME}."
             )
 
         action_used_batch = pred.transpose(1, 2, 0).reshape(-1, pred.shape[0])

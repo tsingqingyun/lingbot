@@ -1276,6 +1276,12 @@ class Trainer:
                     torch.save({
                         'step': self.step,
                         'optimizer_state_dict': optim_state,
+                        'lr_scheduler_state_dict': (
+                            self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None
+                        ),
+                        'grad_scaler_state_dict': (
+                            self._grad_scaler.state_dict() if self._use_fp16_scaler else None
+                        ),
                         'config': vars(self.config),
                     }, training_state_path)
 
@@ -1341,6 +1347,44 @@ class Trainer:
                         "Continue from model weights at step %d with a fresh optimizer.",
                         e,
                         self.step,
+                    )
+
+        scheduler_state = training_state.get('lr_scheduler_state_dict')
+        if self.lr_scheduler is not None:
+            if scheduler_state is not None:
+                try:
+                    self.lr_scheduler.load_state_dict(scheduler_state)
+                except Exception as e:
+                    if self.config.rank == 0:
+                        logger.warning(
+                            "Skipping lr_scheduler state restore due to mismatch: %r. "
+                            "Will align scheduler to global step %d.",
+                            e,
+                            self.step,
+                        )
+                    try:
+                        self.lr_scheduler.step(self.step)
+                    except Exception:
+                        for _ in range(self.step):
+                            self.lr_scheduler.step()
+            else:
+                # Backward compatibility for old checkpoints: align scheduler to restored step.
+                try:
+                    self.lr_scheduler.step(self.step)
+                except Exception:
+                    for _ in range(self.step):
+                        self.lr_scheduler.step()
+
+        grad_scaler_state = training_state.get('grad_scaler_state_dict')
+        if self._use_fp16_scaler and grad_scaler_state is not None:
+            try:
+                self._grad_scaler.load_state_dict(grad_scaler_state)
+            except Exception as e:
+                if self.config.rank == 0:
+                    logger.warning(
+                        "Skipping GradScaler state restore due to mismatch: %r. "
+                        "Continue with fresh scaler.",
+                        e,
                     )
 
         if self.config.rank == 0:
@@ -1422,7 +1466,7 @@ class Trainer:
 
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
-                    progress_bar.n += self.gradient_accumulation_steps
+                    progress_bar.n += 1
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
