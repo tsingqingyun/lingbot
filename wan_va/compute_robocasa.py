@@ -87,7 +87,7 @@ def main():
         "count": count,
     }
 
-    save_path = "robocasa_30d_norm_stats.json"
+    save_path = "/root/lingbot_va/lingbot-va/wan_va/robocasa_30d_norm_stats_new.json"
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
 

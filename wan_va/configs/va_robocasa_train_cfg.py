@@ -46,14 +46,14 @@ va_robocasa_train_cfg.warmup_steps = 10
 # 每卡每 optimizer step 样本数 = batch_size * gradient_accumulation_steps（再 × world_size 为整节点）。
 # 此前 bs=2 易 OOM；用 bs=1、grad_accum=8 与「每卡 2×4=8 个样本/step」对齐且峰值更低。
 va_robocasa_train_cfg.batch_size = 1
-va_robocasa_train_cfg.gradient_accumulation_steps = 8
+va_robocasa_train_cfg.gradient_accumulation_steps = 1
 # 训练时 window_size 原逻辑为 randint(4,65)→最大 64，偶发极大序列会顶满显存；此处限制上界（含）。
 va_robocasa_train_cfg.train_window_size_max = 40
 # Binary auxiliary supervision for discrete action channels:
 # 14 = gripper, 29 = control_mode (in LingBot 30D space).
 va_robocasa_train_cfg.enable_binary_action_aux = True
 va_robocasa_train_cfg.binary_action_aux_channels = [14, 29]
-va_robocasa_train_cfg.binary_action_aux_weight = 0.25
+va_robocasa_train_cfg.binary_action_aux_weight = 0.4
 va_robocasa_train_cfg.binary_action_aux_loss_type = "focal"  # "bce" | "focal"
 va_robocasa_train_cfg.binary_action_aux_focal_gamma = 2.0
 va_robocasa_train_cfg.binary_action_aux_pos_weight = 1.5

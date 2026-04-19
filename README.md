@@ -231,6 +231,55 @@ python -m evaluation.robocasa.eval_policy_client_openpi \
 The client maps LingBot predicted channels back to RoboCasa 12D control actions using the built-in `lingbot_to_robocasa` mapping, and writes unified metrics to:
 `<save_root>/metrics/res.json`.
 
+### Evaluation on LIBERO
+
+Post-training and inference scripts for LIBERO are available under `evaluation/libero/`.
+
+Recommended dataset (from upstream release):
+
+- LIBERO LONG: `https://drive.google.com/file/d/1QGNkvsb1hlRmRkKCgFlyWitv17sRuagS/view`
+
+Environment (extra dependency on top of current post-training stack):
+
+```bash
+pip install libero-libero
+```
+
+If `libero-libero` is unavailable in your environment, install LIBERO from source:
+
+```bash
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+cd LIBERO
+pip install -e .
+```
+
+Set model and dataset paths:
+
+```bash
+export LINGBOT_LIBERO_MODEL_PATH=/path/to/checkpoint_step_xxx
+export LINGBOT_WAN_BASE_PATH=/path/to/wan22_root
+export LINGBOT_LIBERO_DATASET_PATH=/path/to/libero_long_lerobot
+```
+
+Run evaluation:
+
+```bash
+# server
+bash evaluation/libero/launch_server.sh
+
+# client
+bash evaluation/libero/launch_client.sh
+```
+
+For custom split/range:
+
+```bash
+START=0 END=10 LIBERO_BENCHMARK=libero_10 TEST_NUM=50 PORT=29056 OUT_DIR=outputs/libero \
+bash evaluation/libero/launch_client.sh
+```
+
+Detailed setup is also documented in `evaluation/libero/README.md`.
+
 
 ## Post-Training LingBot-VA
 
@@ -370,7 +419,11 @@ The latent file naming convention `episode_{index}_{start_frame}_{end_frame}.pth
 Torch distributed (existing path):
 
 ```bash
-NGPU=8 bash script/run_va_posttrain.sh
+# RoboTwin
+NGPU=8 CONFIG_NAME=robotwin_train bash script/run_va_posttrain.sh
+
+# LIBERO
+NGPU=8 CONFIG_NAME=libero_train bash script/run_va_posttrain.sh
 ```
 
 DeepSpeed + ZeRO-2 Offload (new path):

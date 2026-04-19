@@ -55,5 +55,14 @@ def get_config(config_name):
     elif config_name == 'robocasa_train':
         from .va_robocasa_train_cfg import va_robocasa_train_cfg
         return va_robocasa_train_cfg
+    elif config_name == 'libero':
+        from .va_libero_cfg import va_libero_cfg
+        return va_libero_cfg
+    elif config_name == 'libero_train':
+        from .va_libero_train_cfg import va_libero_train_cfg
+        return va_libero_train_cfg
+    elif config_name == 'libero_i2av':
+        from .va_libero_i2va import va_libero_i2va_cfg
+        return va_libero_i2va_cfg
     else:
         raise KeyError(f"Unknown config name: {config_name}")
