@@ -1553,7 +1553,15 @@ def run(args):
     config.world_size = world_size
 
     if args.save_root is not None:
-        config.save_root = args.save_root
+        old_save_root = str(getattr(config, "save_root", ""))
+        new_save_root = str(args.save_root)
+        config.save_root = new_save_root
+        # Keep CUDA memory CSV under the same run root when --save-root overrides config.
+        cuda_mem_log_path = getattr(config, "cuda_mem_log_path", None)
+        if cuda_mem_log_path:
+            raw_log_path = str(cuda_mem_log_path)
+            if old_save_root and raw_log_path.startswith(old_save_root):
+                config.cuda_mem_log_path = new_save_root + raw_log_path[len(old_save_root):]
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")

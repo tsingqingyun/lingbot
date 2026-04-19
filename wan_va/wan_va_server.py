@@ -410,12 +410,13 @@ class VA_Server:
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
-        if len(images) < 1:
+        real_frame_count = len(images)
+        if real_frame_count < 1:
             return None
         min_obs_frames = self._min_obs_frames_for_encode()
-        if len(images) < min_obs_frames:
+        if real_frame_count < min_obs_frames:
             # Warm-cache encode needs enough frames for stacked temporal downsample.
-            pad_count = min_obs_frames - len(images)
+            pad_count = min_obs_frames - real_frame_count
             images = [copy.deepcopy(images[0]) for _ in range(pad_count)] + images
         videos = []
         for k_i, k in enumerate(self.job_config.obs_cam_keys):
@@ -461,6 +462,12 @@ class VA_Server:
         latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
         mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+        # Padding frames are only for temporal conv context; keep real timeline length.
+        if (
+            real_frame_count > 0
+            and video_latent.shape[2] > real_frame_count
+        ):
+            video_latent = video_latent[:, :, -real_frame_count:]
         return video_latent.to(self.device)
 
     def _reset(
