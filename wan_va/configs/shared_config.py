@@ -11,7 +11,7 @@ va_shared_cfg.port = 29536
 va_shared_cfg.infer_mode = 'server'
 
 va_shared_cfg.param_dtype = torch.bfloat16
-va_shared_cfg.save_root = './train_out_new_04192055'
+va_shared_cfg.save_root = './train_out_new_04200104'
 
 va_shared_cfg.patch_size = (1, 2, 2)
 

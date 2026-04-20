@@ -53,10 +53,15 @@ va_robocasa_train_cfg.train_window_size_max = 40
 # 14 = gripper, 29 = control_mode (in LingBot 30D space).
 va_robocasa_train_cfg.enable_binary_action_aux = True
 va_robocasa_train_cfg.binary_action_aux_channels = [14, 29]
-va_robocasa_train_cfg.binary_action_aux_weight = 0.4
+va_robocasa_train_cfg.binary_action_aux_weight = 0.8
 va_robocasa_train_cfg.binary_action_aux_loss_type = "focal"  # "bce" | "focal"
 va_robocasa_train_cfg.binary_action_aux_focal_gamma = 2.0
 va_robocasa_train_cfg.binary_action_aux_pos_weight = 1.5
+# Debug: print action reconstruction vs GT for tail dims.
+va_robocasa_train_cfg.enable_action_debug_print = True
+va_robocasa_train_cfg.action_debug_print_every = 10
+va_robocasa_train_cfg.action_debug_tail_dims = 30
+va_robocasa_train_cfg.action_debug_print_robocasa12 = True
 # 0 = 每层对 attn1/ffn 额外做 AC（更省显存、更慢）；10 = 仅后 20 层（默认与其它任务一致）
 va_robocasa_train_cfg.ac_inner_checkpoint_min_layer = 0
 va_robocasa_train_cfg.num_steps = 50000

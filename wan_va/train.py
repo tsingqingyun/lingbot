@@ -49,7 +49,11 @@ from utils import (
 )
 
 from .dataset import MultiLatentLeRobotDataset
-from .dataset.lerobot_latent_dataset import get_robocasa_binarize_thresholds
+from .dataset.lerobot_latent_dataset import (
+    get_robocasa_binarize_thresholds,
+    denormalize_action_30,
+    lingbot_to_robocasa,
+)
 import gc
 
 
@@ -350,6 +354,20 @@ class Trainer:
         self.binary_action_aux_logit_scale = float(
             getattr(config, "binary_action_aux_logit_scale", 8.0)
         )
+        self.enable_action_debug_print = bool(
+            getattr(config, "enable_action_debug_print", False)
+        )
+        self.action_debug_print_every = int(
+            getattr(config, "action_debug_print_every", 20)
+        )
+        self.action_debug_tail_dims = int(
+            getattr(config, "action_debug_tail_dims", 12)
+        )
+        self.action_debug_print_robocasa12 = bool(
+            getattr(config, "action_debug_print_robocasa12", True)
+        )
+        self._last_action_debug_step = -1
+        self._is_validating = False
         self._last_binary_action_aux_loss = torch.tensor(0.0, device=self.device)
 
         # Load models
@@ -907,41 +925,154 @@ class Trainer:
         return (action_generation_mse_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
     @torch.no_grad()
+    def _maybe_log_action_debug(self, action_pred, action_dict):
+        if not self.enable_action_debug_print:
+            return
+        if self._is_validating:
+            return
+        if self.config.rank != 0:
+            return
+        if self.action_debug_print_every <= 0:
+            return
+        if self.step == self._last_action_debug_step:
+            return
+        if (self.step % self.action_debug_print_every) != 0:
+            return
+
+        action_recon = self._compute_action_reconstruction(action_pred, action_dict)
+        action_target = action_dict['latent'].float().detach()
+        action_mask = action_dict['actions_mask'].float()
+
+        num_channels = action_recon.shape[1]
+        tail_dims = max(1, min(self.action_debug_tail_dims, num_channels))
+
+        recon_tail = action_recon[:, -tail_dims:, :, :, :]
+        target_tail = action_target[:, -tail_dims:, :, :, :]
+        mask_tail = action_mask[:, -tail_dims:, :, :, :]
+
+        sq_err = (recon_tail - target_tail).pow(2) * mask_tail
+        token_valid = (mask_tail.sum(dim=1) > 0)  # [B, F, N, 1]
+        token_mse = sq_err.sum(dim=1) / (mask_tail.sum(dim=1) + 1e-6)  # [B, F, N, 1]
+        token_mse = token_mse.masked_fill(~token_valid, -1.0)
+        flat_mse = token_mse.reshape(-1)
+
+        best_value, best_idx = torch.max(flat_mse, dim=0)
+        if best_value.item() < 0:
+            return
+
+        _, _, n_dim, w_dim = token_mse.shape
+        idx = int(best_idx.item())
+        b_idx = idx // (token_mse.shape[1] * n_dim * w_dim)
+        rem = idx % (token_mse.shape[1] * n_dim * w_dim)
+        f_idx = rem // (n_dim * w_dim)
+        rem = rem % (n_dim * w_dim)
+        n_idx = rem // w_dim
+        w_idx = rem % w_dim
+
+        pred_vec = recon_tail[b_idx, :, f_idx, n_idx, w_idx].detach().float().cpu()
+        gt_vec = target_tail[b_idx, :, f_idx, n_idx, w_idx].detach().float().cpu()
+        diff_vec = (pred_vec - gt_vec).abs()
+
+        pred_str = ", ".join(f"{x:.4f}" for x in pred_vec.tolist())
+        gt_str = ", ".join(f"{x:.4f}" for x in gt_vec.tolist())
+        diff_str = ", ".join(f"{x:.4f}" for x in diff_vec.tolist())
+        extra_robocasa12_lines = ""
+        if self.action_debug_print_robocasa12:
+            pred_token_norm_30 = action_recon[b_idx, :, f_idx, n_idx, w_idx].detach().float()
+            gt_token_norm_30 = action_target[b_idx, :, f_idx, n_idx, w_idx].detach().float()
+            if (
+                getattr(self.config, "action_norm_method", "") == "quantiles"
+                and hasattr(self.config, "norm_stat")
+                and isinstance(self.config.norm_stat, dict)
+                and "q01" in self.config.norm_stat
+                and "q99" in self.config.norm_stat
+            ):
+                pred_token_30 = denormalize_action_30(
+                    pred_token_norm_30,
+                    self.config.norm_stat["q01"],
+                    self.config.norm_stat["q99"],
+                )
+                gt_token_30 = denormalize_action_30(
+                    gt_token_norm_30,
+                    self.config.norm_stat["q01"],
+                    self.config.norm_stat["q99"],
+                )
+            else:
+                pred_token_30 = pred_token_norm_30
+                gt_token_30 = gt_token_norm_30
+
+            pred_robo12 = lingbot_to_robocasa(pred_token_30.unsqueeze(0)).squeeze(0).detach().float().cpu()
+            gt_robo12 = lingbot_to_robocasa(gt_token_30.unsqueeze(0)).squeeze(0).detach().float().cpu()
+            diff_robo12 = (pred_robo12 - gt_robo12).abs()
+            mse_robo12 = float(torch.mean((pred_robo12 - gt_robo12).pow(2)).item())
+
+            pred_robo12_str = ", ".join(f"{x:.4f}" for x in pred_robo12.tolist())
+            gt_robo12_str = ", ".join(f"{x:.4f}" for x in gt_robo12.tolist())
+            diff_robo12_str = ", ".join(f"{x:.4f}" for x in diff_robo12.tolist())
+            extra_robocasa12_lines = (
+                f"\n  pred_robo12=[{pred_robo12_str}]"
+                f"\n  gt_robo12=[{gt_robo12_str}]"
+                f"\n  abs_diff_robo12=[{diff_robo12_str}]"
+                f"\n  robocasa12_mse={mse_robo12:.6f}"
+            )
+        logger.info(
+            "[ActionDebug] step=%d tail_dims=%d token=(b=%d,f=%d,n=%d,w=%d) tail_mse=%.6f\n"
+            "  pred_tail=[%s]\n"
+            "  gt_tail=[%s]\n"
+            "  abs_diff=[%s]%s",
+            self.step,
+            tail_dims,
+            b_idx,
+            f_idx,
+            n_idx,
+            w_idx,
+            float(best_value.item()),
+            pred_str,
+            gt_str,
+            diff_str,
+            extra_robocasa12_lines,
+        )
+        self._last_action_debug_step = self.step
+
+    @torch.no_grad()
     def validate(self):
         if self.val_loader is None:
             return None
 
         was_training = self.transformer.training
         self.transformer.eval()
+        self._is_validating = True
 
         latent_losses = []
         action_losses = []
         action_generation_mses = []
 
-        for batch_idx, batch in enumerate(self.val_loader):
-            if batch_idx >= self.validation_num_batches:
-                break
-            batch = self.convert_input_format(batch)
-            input_dict = self._prepare_input_dict(batch)
+        try:
+            for batch_idx, batch in enumerate(self.val_loader):
+                if batch_idx >= self.validation_num_batches:
+                    break
+                batch = self.convert_input_format(batch)
+                input_dict = self._prepare_input_dict(batch)
 
-            with autocast(
-                device_type="cuda",
-                dtype=self._amp_dtype,
-                enabled=self._use_amp,
-            ):
-                output = self.transformer(input_dict, train_mode=True)
-                latent_loss, action_loss, action_generation_mse = self.compute_loss(
-                    input_dict,
-                    output,
-                    scale_by_grad_accum=False,
-                )
+                with autocast(
+                    device_type="cuda",
+                    dtype=self._amp_dtype,
+                    enabled=self._use_amp,
+                ):
+                    output = self.transformer(input_dict, train_mode=True)
+                    latent_loss, action_loss, action_generation_mse = self.compute_loss(
+                        input_dict,
+                        output,
+                        scale_by_grad_accum=False,
+                    )
 
-            latent_losses.append(latent_loss.detach())
-            action_losses.append(action_loss.detach())
-            action_generation_mses.append(action_generation_mse.detach())
-
-        if was_training:
-            self.transformer.train()
+                latent_losses.append(latent_loss.detach())
+                action_losses.append(action_loss.detach())
+                action_generation_mses.append(action_generation_mse.detach())
+        finally:
+            if was_training:
+                self.transformer.train()
+            self._is_validating = False
 
         if not latent_losses:
             return None
@@ -1061,6 +1192,10 @@ class Trainer:
 
         with torch.no_grad():
             action_generation_mse = self._compute_action_generation_mse(
+                action_pred,
+                input_dict['action_dict'],
+            )
+            self._maybe_log_action_debug(
                 action_pred,
                 input_dict['action_dict'],
             )
