@@ -13,7 +13,8 @@ va_robocasa_cfg.wan22_pretrained_model_name_or_path = (
     os.environ.get(
         "LINGBOT_ROBOCASA_MODEL_PATH",
         #"/cephfs/shared/xcxhx/lingbot-va",
-        "/cephfs/shared/xcx/lingbot-va/train_out/checkpoint_step_500",
+        #"/cephfs/shared/xcx/lingbot-va/train_out/checkpoint_step_500",
+        "/cephfs/shared/xcx/lingbot-va/train_out_0420/checkpoint_step_100",
     )
 )
 # Optional: checkpoint directory for resume/finetune.
@@ -46,7 +47,7 @@ va_robocasa_cfg.obs_cam_keys = [
 va_robocasa_cfg.guidance_scale = 5
 va_robocasa_cfg.action_guidance_scale = 1
 
-va_robocasa_cfg.num_inference_steps = 25
+va_robocasa_cfg.num_inference_steps = 40
 va_robocasa_cfg.video_exec_step = -1
 va_robocasa_cfg.action_num_inference_steps = 50
 

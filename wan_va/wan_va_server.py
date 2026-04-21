@@ -114,6 +114,7 @@ class VA_Server:
         self.video_guidance_scale = float(getattr(self.job_config, "guidance_scale", 1.0))
         self.action_guidance_scale = float(getattr(self.job_config, "action_guidance_scale", 1.0))
         self.use_cfg = (self.video_guidance_scale > 1.0) or (self.action_guidance_scale > 1.0)
+        self.video_processor = VideoProcessor(vae_scale_factor=1)
 
     def _set_runtime_guidance_scales(
         self,
@@ -299,6 +300,30 @@ class VA_Server:
         # normalized "raw zero" values (typically -1 under quantile stats).
         action_model_input = action_model_input * self.action_mask[:, None, None].to(action_model_input)
         return action_model_input.unsqueeze(0).unsqueeze(-1)  # B, C, F, H, W
+
+    def _make_zero_action_condition(self):
+        """
+        Build the start-of-rollout action condition using the same raw-zero -> normalized
+        mapping as train-time RoboCasa padding, instead of inserting normalized zeros.
+        """
+        zero_action = torch.zeros(
+            self.job_config.action_dim,
+            1,
+            self.action_per_frame,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        if self.action_norm_method == 'quantiles':
+            zero_action = (zero_action - self.actions_q01.to(self.device)) / (
+                self.actions_q99.to(self.device) - self.actions_q01.to(self.device) + 1e-6
+            ) * 2.0 - 1.0
+        else:
+            raise NotImplementedError
+        zero_action = zero_action * self.action_mask[:, None, None].to(
+            device=self.device,
+            dtype=zero_action.dtype,
+        )
+        return zero_action.unsqueeze(0).unsqueeze(-1).to(dtype=self.dtype)
 
     def postprocess_action(self, action):
         action = action.cpu()  # B, C, F, H, W
@@ -628,13 +653,7 @@ class VA_Server:
 
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
-                action_cond = torch.zeros(
-                    [
-                        1, self.job_config.action_dim, 1,
-                        self.action_per_frame, 1
-                    ],
-                    device=self.device,
-                    dtype=self.dtype) if frame_st_id == 0 else None
+                action_cond = self._make_zero_action_condition() if frame_st_id == 0 else None
 
                 input_dict = self._prepare_latent_input(
                     None,
@@ -715,6 +734,8 @@ class VA_Server:
         compute_kv_cache = obs.get('compute_kv_cache', False)
         video_guidance_scale = obs.get('video_guidance_scale', None)
         action_guidance_scale = obs.get('action_guidance_scale', None)
+        return_video = bool(obs.get('return_video', False))
+        return_latents = bool(obs.get('return_latents', False))
 
         if reset:
             logger.info(f"******************* Reset server ******************")
@@ -741,18 +762,27 @@ class VA_Server:
                 action_guidance_scale=action_guidance_scale,
                 allow_cfg_mode_change=False,
             )
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            return dict(action=action)
+            action, latents = self._infer(obs, frame_st_id=self.frame_st_id)
+            out = dict(action=action)
+            if return_latents:
+                out["latents"] = (
+                    latents.detach().to(dtype=torch.float16).cpu().numpy()
+                )
+            if return_video:
+                decoded_video = self.decode_one_video(latents, 'np')[0]
+                out["video"] = np.asarray(decoded_video)
+            return out
     
     def decode_one_video(self, latents, output_type):
-        latents = latents.to(self.vae.dtype)
+        vae_device = next(self.vae.parameters()).device
+        latents = latents.to(device=vae_device, dtype=self.vae.dtype)
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
+            .to(device=vae_device, dtype=latents.dtype)
         )
         latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
+            device=vae_device, dtype=latents.dtype
         )
         latents = latents / latents_std + latents_mean
         video = self.vae.decode(latents, return_dict=False)[0]
