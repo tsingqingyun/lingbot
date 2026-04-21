@@ -56,6 +56,9 @@ def _infer_used_action_channel_ids() -> List[int]:
 USED_ACTION_CHANNEL_IDS = _infer_used_action_channel_ids()
 BIN_THRESHOLDS = get_robocasa_binarize_thresholds()
 ROBOCASA_ACTION_PER_FRAME = int(get_config("robocasa").action_per_frame)
+CONTROL_MODE_COLLAPSE_EPS = 1e-6
+CONTROL_MODE_COLLAPSE_STREAK_THRESHOLD = 4
+CONTROL_MODE_REPLAN_COOLDOWN_STEPS = 32
 
 
 def _find_obs_value(obs: Dict, candidates: Iterable[str]):
@@ -117,11 +120,11 @@ def robocasa_action12_to_gym_dict(action_12: np.ndarray) -> Dict[str, np.ndarray
         raise ValueError(f"Expected RoboCasa action dim 12, got shape {getattr(action_12, 'shape', None)}")
     # Same layout as ``wan_va.dataset.lerobot_latent_dataset.robocasa_to_lingbot``.
     return {
-        "action.end_effector_position": a[0:3].copy(),
-        "action.end_effector_rotation": a[3:6].copy(),
-        "action.gripper_close": a[6:7].copy(),
-        "action.base_motion": a[7:11].copy(),
-        "action.control_mode": a[11:12].copy(),
+        "action.base_motion": a[0:4].copy(),
+        "action.control_mode": a[4:5].copy(),
+        "action.end_effector_position": a[5:8].copy(),
+        "action.end_effector_rotation": a[8:11].copy(),
+        "action.gripper_close": a[11:12].copy(),
     }
 
 
@@ -145,9 +148,9 @@ def summarize_episode_action_stats(executed_actions: List[np.ndarray], clipped_s
         }
 
     arr = np.asarray(executed_actions, dtype=np.float32).reshape(-1, 12)
-    base = arr[:, 7:11]
-    mode = arr[:, 11]
-    gripper = arr[:, 6]
+    base = arr[:, 0:4]
+    mode = arr[:, 4]
+    gripper = arr[:, 11]
 
     base_absdiff = np.abs(np.diff(base, axis=0)) if arr.shape[0] > 1 else np.zeros((0, 4), dtype=np.float32)
     mode_change_rate = float(np.mean(mode[1:] != mode[:-1])) if mode.shape[0] > 1 else 0.0
@@ -183,9 +186,9 @@ def summarize_chunk_prediction(
     action_30_seq = action_30_batch.reshape(pred.shape[1], pred.shape[2], 30)
     gate_raw = action_30_seq[:, :, 29]
     gripper_raw = action_30_seq[:, :, 14]
-    base = action_12_seq[:, :, 7:11].reshape(-1, 4)
-    control_mode = action_12_seq[:, :, 11].reshape(-1)
-    gripper_exec = action_12_seq[:, :, 6].reshape(-1)
+    base = action_12_seq[:, :, 0:4].reshape(-1, 4)
+    control_mode = action_12_seq[:, :, 4].reshape(-1)
+    gripper_exec = action_12_seq[:, :, 11].reshape(-1)
     start_idx = 1 if first_chunk else 0
     executable_steps = max(0, pred.shape[2] * max(0, pred.shape[1] - start_idx))
 
